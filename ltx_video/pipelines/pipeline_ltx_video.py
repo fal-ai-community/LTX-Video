@@ -1812,7 +1812,7 @@ class LTXMultiScalePipeline:
     def unload_lora_weights(self, *args, **kwargs):
         return self.video_pipeline.unload_lora_weights(*args, **kwargs)
 
-    def set_adapters(adapter_names, weights):
+    def set_adapters(self, adapter_names, weights):
         weights = [w if w is not None else 1.0 for w in weights]
         set_weights_and_activate_adapters(self.video_pipeline.transformer, adapter_names, weights)
 
