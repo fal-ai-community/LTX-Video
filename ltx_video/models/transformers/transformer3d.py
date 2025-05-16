@@ -506,11 +506,3 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             return (hidden_states,)
 
         return Transformer3DModelOutput(sample=hidden_states)
-
-class LTXVideoTransformer3DModel(Transformer3DModel):
-    """
-    We define a class that inherits from `Transformer3DModel`.
-    The name of this model is used to look up scales within peft itself, so this specific
-    name (LTXVideoTransformer3DModel) is important when using LoRA.
-    """
-    pass

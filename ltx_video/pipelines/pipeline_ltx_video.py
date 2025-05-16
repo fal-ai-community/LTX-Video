@@ -13,7 +13,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from diffusers.schedulers import DPMSolverMultistepScheduler
-from diffusers.utils import deprecate, logging
+from diffusers.utils import deprecate, logging, set_weights_and_activate_adapters
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.loaders import LTXVideoLoraLoaderMixin
 from einops import rearrange
@@ -1811,6 +1811,10 @@ class LTXMultiScalePipeline:
 
     def unload_lora_weights(self, *args, **kwargs):
         return self.video_pipeline.unload_lora_weights(*args, **kwargs)
+
+    def set_adapters(adapter_names, weights):
+        weights = [w if w is not None else 1.0 for w in weights]
+        set_weights_and_activate_adapters(self.video_pipeline.transformer, adapter_names, weights)
 
     def __call__(
         self,
