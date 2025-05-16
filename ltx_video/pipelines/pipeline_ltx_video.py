@@ -15,6 +15,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineO
 from diffusers.schedulers import DPMSolverMultistepScheduler
 from diffusers.utils import deprecate, logging
 from diffusers.utils.torch_utils import randn_tensor
+from diffusers.loaders import LTXVideoLoraLoaderMixin
 from einops import rearrange
 from transformers import (
     T5EncoderModel,
@@ -215,7 +216,7 @@ class ConditioningItem:
     media_y: Optional[int] = None
 
 
-class LTXVideoPipeline(DiffusionPipeline):
+class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
     r"""
     Pipeline for text-to-image generation using LTX-Video.
 
@@ -299,6 +300,21 @@ class LTXVideoPipeline(DiffusionPipeline):
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
         self.allowed_inference_steps = allowed_inference_steps
+
+    @classmethod
+    def lora_state_dict(
+        cls,
+        pretrained_model_name_or_path_or_dict,
+        **kwargs
+    ):
+        state_dict = super().lora_state_dict(
+            pretrained_model_name_or_path_or_dict,
+            **kwargs
+        )
+        return {
+            key.replace("diffusion_model.", "transformer."): value
+            for key, value in state_dict.items()
+        }
 
     def mask_text_embeddings(self, emb, mask):
         if emb.shape[0] == 1:
@@ -1789,6 +1805,12 @@ class LTXMultiScalePipeline:
         self.video_pipeline = video_pipeline
         self.vae = video_pipeline.vae
         self.latent_upsampler = latent_upsampler
+
+    def load_lora_weights(self, *args, **kwargs):
+        return self.video_pipeline.load_lora_weights(*args, **kwargs)
+
+    def unload_lora_weights(self, *args, **kwargs):
+        return self.video_pipeline.unload_lora_weights(*args, **kwargs)
 
     def __call__(
         self,

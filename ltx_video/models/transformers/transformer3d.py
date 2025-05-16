@@ -11,6 +11,7 @@ import torch
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers.loaders import PeftAdapterMixin
 from diffusers.models.normalization import AdaLayerNormSingle
 from diffusers.utils import BaseOutput, is_torch_version
 from diffusers.utils import logging
@@ -45,7 +46,7 @@ class Transformer3DModelOutput(BaseOutput):
     sample: torch.FloatTensor
 
 
-class Transformer3DModel(ModelMixin, ConfigMixin):
+class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     _supports_gradient_checkpointing = True
 
     @register_to_config
