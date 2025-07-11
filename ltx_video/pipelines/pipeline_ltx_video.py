@@ -204,14 +204,14 @@ class ConditioningItem:
 
     This can represent:
     - Regular image/video conditioning (type="image" or "video")
-    - IC-LoRA guiding latents (type="guiding_latents")
+    - IC-LoRA guiding video (type="guiding")
     - Any future conditioning types
 
     Attributes:
         media_item (torch.Tensor): The conditioning data in pixel space.
             - For all types: shape=(b, 3, f, h, w) where b=batch, f=frames, h=height, w=width
             - Guiding latents should be passed as pixel-space videos (depth/pose/etc)
-        conditioning_type (str): Type of conditioning - "image", "video", or "guiding_latents"
+        conditioning_type (str): Type of conditioning - "image", "video", or "guiding"
         media_frame_number (int): The start-frame number in the generated video
         conditioning_strength (float): The strength of the conditioning (0.0-1.0)
         media_x (Optional[int]): Optional left x coordinate (for spatial conditioning)
@@ -219,7 +219,7 @@ class ConditioningItem:
     """
 
     media_item: torch.Tensor
-    conditioning_type: str = "image"  # "image", "video", or "guiding_latents"
+    conditioning_type: str = "image"  # "image", "video", or "guiding"
     media_frame_number: int = 0
     conditioning_strength: float = 1.0
     media_x: Optional[int] = None
@@ -915,7 +915,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             conditioning_items (`List[ConditioningItem]`, *optional*):
                 List of unified conditioning items that can include:
                 - Regular image/video conditioning (type="image" or "video")
-                - IC-LoRA guiding latents (type="guiding_latents")
+                - IC-LoRA guiding latents (type="guiding")
                 Multiple IC-LoRA types (depth, pose, etc.) can be used simultaneously.
         Examples:
 
@@ -1422,153 +1422,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         tokens_to_denoise_mask = (t - t_eps < (1.0 - conditioning_mask)).unsqueeze(-1)
         return torch.where(tokens_to_denoise_mask, denoised_latents, latents)
 
-    def prepare_guiding_latents(
-        self,
-        guiding_latents: Optional[torch.FloatTensor],
-        guiding_latents_strength: float,
-        guiding_latents_start_frame: int,
-        init_latents: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-        generator=None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """
-        Prepare guiding latents for in-context sampling.
-
-        This method integrates pre-computed guiding latents (typically from IC-LoRA models)
-        into the sampling process to provide structural guidance.
-
-        Args:
-            guiding_latents (Optional[torch.FloatTensor]): Pre-computed guiding latents
-            guiding_latents_strength (float): Strength of the guiding latents
-            guiding_latents_start_frame (int): Start frame for applying guiding latents
-            init_latents (torch.Tensor): Initial latent tensor
-            num_frames (int): Number of frames to generate
-            height (int): Height of the generated video
-            width (int): Width of the generated video
-            generator: Random generator for noise blending
-
-        Returns:
-            Tuple containing updated latents, pixel coordinates, conditioning mask, and num extra latents
-        """
-        if guiding_latents is None:
-            # No guiding latents provided, return original latents
-            init_latents, init_pixel_coords = self.patchifier.patchify(
-                latents=init_latents
-            )
-            init_pixel_coords = latent_to_pixel_coords(
-                init_pixel_coords,
-                self.vae,
-                causal_fix=self.transformer.config.causal_temporal_positioning,
-            )
-            return init_latents, init_pixel_coords, None, 0
-
-        # Validate guiding latents shape
-        batch_size, channels, guide_frames, guide_height, guide_width = (
-            guiding_latents.shape
-        )
-        assert batch_size == 1, "Guiding latents must have batch size 1"
-        assert (
-            channels == self.transformer.config.in_channels
-        ), f"Guiding latents must have {self.transformer.config.in_channels} channels"
-
-        # Ensure guiding latents are on correct device/dtype
-        guiding_latents = guiding_latents.to(
-            device=init_latents.device, dtype=init_latents.dtype
-        )
-
-        # Adjust start frame for latent space
-        latent_start_frame = guiding_latents_start_frame // self.video_scale_factor
-
-        # Create extra conditioning latents and masks
-        extra_conditioning_latents = []
-        extra_conditioning_pixel_coords = []
-        extra_conditioning_mask = []
-        extra_conditioning_num_latents = 0
-
-        # Blend guiding latents with noise if needed
-        if guiding_latents_strength < 1.0:
-            noise = randn_tensor(
-                guiding_latents.shape,
-                generator=generator,
-                device=guiding_latents.device,
-                dtype=guiding_latents.dtype,
-            )
-            guiding_latents = torch.lerp(
-                noise, guiding_latents, guiding_latents_strength
-            )
-
-        # Patchify the guiding latents and calculate their pixel coordinates
-        guiding_latents_patchified, latent_coords = self.patchifier.patchify(
-            latents=guiding_latents
-        )
-        pixel_coords = latent_to_pixel_coords(
-            latent_coords,
-            self.vae,
-            causal_fix=self.transformer.config.causal_temporal_positioning,
-        )
-
-        # Update frame numbers to match the target frame number
-        pixel_coords[:, 0] += latent_start_frame
-        extra_conditioning_num_latents += guiding_latents_patchified.shape[1]
-
-        # Create conditioning mask for guiding latents
-        conditioning_mask = torch.full(
-            guiding_latents_patchified.shape[:2],
-            guiding_latents_strength,
-            dtype=torch.float32,
-            device=init_latents.device,
-        )
-
-        extra_conditioning_latents.append(guiding_latents_patchified)
-        extra_conditioning_pixel_coords.append(pixel_coords)
-        extra_conditioning_mask.append(conditioning_mask)
-
-        # Patchify the initial latents
-        init_latents, init_latent_coords = self.patchifier.patchify(
-            latents=init_latents
-        )
-        init_pixel_coords = latent_to_pixel_coords(
-            init_latent_coords,
-            self.vae,
-            causal_fix=self.transformer.config.causal_temporal_positioning,
-        )
-
-        # Create initial conditioning mask (no conditioning for init latents)
-        init_conditioning_mask = torch.zeros(
-            init_latents.shape[:2],
-            dtype=torch.float32,
-            device=init_latents.device,
-        )
-
-        # Combine guiding latents with initial latents
-        init_latents = torch.cat([*extra_conditioning_latents, init_latents], dim=1)
-        init_pixel_coords = torch.cat(
-            [*extra_conditioning_pixel_coords, init_pixel_coords], dim=2
-        )
-        init_conditioning_mask = torch.cat(
-            [*extra_conditioning_mask, init_conditioning_mask], dim=1
-        )
-
-        if self.transformer.use_tpu_flash_attention:
-            # When flash attention is used, keep the original number of tokens by removing
-            # tokens from the end.
-            init_latents = init_latents[:, :-extra_conditioning_num_latents]
-            init_pixel_coords = init_pixel_coords[
-                :, :, :-extra_conditioning_num_latents
-            ]
-            init_conditioning_mask = init_conditioning_mask[
-                :, :-extra_conditioning_num_latents
-            ]
-
-        return (
-            init_latents,
-            init_pixel_coords,
-            init_conditioning_mask,
-            extra_conditioning_num_latents,
-        )
-
     def prepare_combined_conditioning(
         self,
         conditioning_items: Optional[List[ConditioningItem]],
@@ -1588,7 +1441,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         Args:
             conditioning_items (Optional[List[ConditioningItem]]): List of conditioning items that can include:
                 - Regular image/video conditioning (type="image" or "video")
-                - IC-LoRA guiding latents (type="guiding_latents")
+                - IC-LoRA guiding latents (type="guiding")
                 Multiple IC-LoRA types (depth, pose, etc.) can be used simultaneously
             init_latents (torch.Tensor): Initial latent tensor
             num_frames (int): Number of frames to generate
@@ -1652,7 +1505,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 ).to(dtype=init_latents.dtype)
 
                 # Handle the different conditioning cases
-                if conditioning_type == "guiding_latents":
+                if conditioning_type == "guiding":
                     # For guiding latents, we skip the spatial positioning logic
                     # and go directly to creating extra conditioning tokens
 
