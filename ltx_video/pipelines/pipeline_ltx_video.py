@@ -1628,12 +1628,11 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 assert media_item.ndim == 5  # (b, c, f, h, w)
                 b, c, n_frames, h, w = media_item.shape
 
-                # Resize conditioning item if needed (skip for guiding latents as they need special handling)
-                if conditioning_type != "guiding_latents":
-                    conditioning_item = self._resize_conditioning_item(
-                        conditioning_item, height, width
-                    )
-                    media_item = conditioning_item.media_item
+                # Resize conditioning item if needed
+                conditioning_item = self._resize_conditioning_item(
+                    conditioning_item, height, width
+                )
+                media_item = conditioning_item.media_item
 
                 # Validate dimensions
                 assert (
@@ -1645,7 +1644,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     and media_frame_number + n_frames <= num_frames
                 )
 
-                # Encode ALL conditioning media items (including guiding latents from pixel space)
+                # Encode ALL conditioning media items
                 media_item_latents = vae_encode(
                     media_item.to(dtype=self.vae.dtype, device=self.vae.device),
                     self.vae,
