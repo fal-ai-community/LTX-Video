@@ -1130,34 +1130,21 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             vae_per_channel_normalize=vae_per_channel_normalize,
         )
 
-        # Handle guiding latents for in-context sampling
-        if guiding_latents is not None:
-            # Use guiding latents instead of regular conditioning
-            latents, pixel_coords, conditioning_mask, num_cond_latents = (
-                self.prepare_guiding_latents(
-                    guiding_latents=guiding_latents,
-                    guiding_latents_strength=guiding_latents_strength,
-                    guiding_latents_start_frame=guiding_latents_start_frame,
-                    init_latents=latents,
-                    num_frames=num_frames,
-                    height=height,
-                    width=width,
-                    generator=generator,
-                )
+        # Handle both guiding latents and regular conditioning simultaneously
+        latents, pixel_coords, conditioning_mask, num_cond_latents = (
+            self.prepare_combined_conditioning(
+                conditioning_items=conditioning_items,
+                guiding_latents=guiding_latents,
+                guiding_latents_strength=guiding_latents_strength,
+                guiding_latents_start_frame=guiding_latents_start_frame,
+                init_latents=latents,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                vae_per_channel_normalize=vae_per_channel_normalize,
+                generator=generator,
             )
-        else:
-            # Update the latents with the conditioning items and patchify them into (b, n, c)
-            latents, pixel_coords, conditioning_mask, num_cond_latents = (
-                self.prepare_conditioning(
-                    conditioning_items=conditioning_items,
-                    init_latents=latents,
-                    num_frames=num_frames,
-                    height=height,
-                    width=width,
-                    vae_per_channel_normalize=vae_per_channel_normalize,
-                    generator=generator,
-                )
-            )
+        )
         init_latents = latents.clone()  # Used for image_cond_noise_update
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -1587,6 +1574,277 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             init_latents,
             init_pixel_coords,
             init_conditioning_mask,
+            extra_conditioning_num_latents,
+        )
+
+    def prepare_combined_conditioning(
+        self,
+        conditioning_items: Optional[List[ConditioningItem]],
+        guiding_latents: Optional[torch.FloatTensor],
+        guiding_latents_strength: float,
+        guiding_latents_start_frame: int,
+        init_latents: torch.Tensor,
+        num_frames: int,
+        height: int,
+        width: int,
+        vae_per_channel_normalize: bool = False,
+        generator=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """
+        Prepare both guiding latents and regular conditioning simultaneously.
+
+        This method combines the functionality of prepare_guiding_latents and prepare_conditioning
+        to allow both types of conditioning to work together in the same generation.
+
+        Args:
+            conditioning_items (Optional[List[ConditioningItem]]): Regular conditioning items (images/videos)
+            guiding_latents (Optional[torch.FloatTensor]): Pre-computed guiding latents from IC-LoRA
+            guiding_latents_strength (float): Strength of the guiding latents
+            guiding_latents_start_frame (int): Start frame for applying guiding latents
+            init_latents (torch.Tensor): Initial latent tensor
+            num_frames (int): Number of frames to generate
+            height (int): Height of the generated video
+            width (int): Width of the generated video
+            vae_per_channel_normalize (bool): Whether to normalize channels during VAE encoding
+            generator: Random generator for noise blending
+
+        Returns:
+            Tuple containing updated latents, pixel coordinates, conditioning mask, and num extra latents
+        """
+        # Start with empty lists for all conditioning types
+        extra_conditioning_latents = []
+        extra_conditioning_pixel_coords = []
+        extra_conditioning_mask = []
+        extra_conditioning_num_latents = 0
+
+        # 1. Handle guiding latents first (if provided)
+        if guiding_latents is not None:
+            # Validate guiding latents shape
+            batch_size, channels, guide_frames, guide_height, guide_width = (
+                guiding_latents.shape
+            )
+            assert batch_size == 1, "Guiding latents must have batch size 1"
+            assert (
+                channels == self.transformer.config.in_channels
+            ), f"Guiding latents must have {self.transformer.config.in_channels} channels"
+
+            # Ensure guiding latents are on correct device/dtype
+            guiding_latents = guiding_latents.to(
+                device=init_latents.device, dtype=init_latents.dtype
+            )
+
+            # Adjust start frame for latent space
+            latent_start_frame = guiding_latents_start_frame // self.video_scale_factor
+
+            # Blend guiding latents with noise if needed
+            if guiding_latents_strength < 1.0:
+                noise = randn_tensor(
+                    guiding_latents.shape,
+                    generator=generator,
+                    device=guiding_latents.device,
+                    dtype=guiding_latents.dtype,
+                )
+                guiding_latents = torch.lerp(
+                    noise, guiding_latents, guiding_latents_strength
+                )
+
+            # Patchify the guiding latents and calculate their pixel coordinates
+            guiding_latents_patchified, latent_coords = self.patchifier.patchify(
+                latents=guiding_latents
+            )
+            pixel_coords = latent_to_pixel_coords(
+                latent_coords,
+                self.vae,
+                causal_fix=self.transformer.config.causal_temporal_positioning,
+            )
+
+            # Update frame numbers to match the target frame number
+            pixel_coords[:, 0] += latent_start_frame
+            extra_conditioning_num_latents += guiding_latents_patchified.shape[1]
+
+            # Create conditioning mask for guiding latents
+            conditioning_mask = torch.full(
+                guiding_latents_patchified.shape[:2],
+                guiding_latents_strength,
+                dtype=torch.float32,
+                device=init_latents.device,
+            )
+
+            extra_conditioning_latents.append(guiding_latents_patchified)
+            extra_conditioning_pixel_coords.append(pixel_coords)
+            extra_conditioning_mask.append(conditioning_mask)
+
+        # 2. Handle regular conditioning items (if provided)
+        if conditioning_items:
+            assert isinstance(self.vae, CausalVideoAutoencoder)
+
+            batch_size, _, num_latent_frames = init_latents.shape[:3]
+
+            init_conditioning_mask = torch.zeros(
+                init_latents[:, 0, :, :, :].shape,
+                dtype=torch.float32,
+                device=init_latents.device,
+            )
+
+            # Process each conditioning item
+            for conditioning_item in conditioning_items:
+                conditioning_item = self._resize_conditioning_item(
+                    conditioning_item, height, width
+                )
+                media_item = conditioning_item.media_item
+                media_frame_number = conditioning_item.media_frame_number
+                strength = conditioning_item.conditioning_strength
+                assert media_item.ndim == 5  # (b, c, f, h, w)
+                b, c, n_frames, h, w = media_item.shape
+                assert (
+                    height == h and width == w
+                ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {h}x{w} - allowed only when media_frame_number == 0"
+                assert n_frames % 8 == 1
+                assert (
+                    media_frame_number >= 0
+                    and media_frame_number + n_frames <= num_frames
+                )
+
+                # Encode the provided conditioning media item
+                media_item_latents = vae_encode(
+                    media_item.to(dtype=self.vae.dtype, device=self.vae.device),
+                    self.vae,
+                    vae_per_channel_normalize=vae_per_channel_normalize,
+                ).to(dtype=init_latents.dtype)
+
+                # Handle the different conditioning cases (same logic as original prepare_conditioning)
+                if media_frame_number == 0:
+                    # Get the target spatial position of the latent conditioning item
+                    media_item_latents, l_x, l_y = self._get_latent_spatial_position(
+                        media_item_latents,
+                        conditioning_item,
+                        height,
+                        width,
+                        strip_latent_border=True,
+                    )
+                    b, c_l, f_l, h_l, w_l = media_item_latents.shape
+
+                    # First frame or sequence - just update the initial noise latents and the mask
+                    init_latents[:, :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l] = (
+                        torch.lerp(
+                            init_latents[:, :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l],
+                            media_item_latents,
+                            strength,
+                        )
+                    )
+                    init_conditioning_mask[
+                        :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l
+                    ] = strength
+                else:
+                    # Non-first frame or sequence
+                    if n_frames > 1:
+                        # Handle non-first sequence.
+                        (
+                            init_latents,
+                            init_conditioning_mask,
+                            media_item_latents,
+                        ) = self._handle_non_first_conditioning_sequence(
+                            init_latents,
+                            init_conditioning_mask,
+                            media_item_latents,
+                            media_frame_number,
+                            strength,
+                        )
+
+                    # Single frame or sequence-prefix latents
+                    if media_item_latents is not None:
+                        noise = randn_tensor(
+                            media_item_latents.shape,
+                            generator=generator,
+                            device=media_item_latents.device,
+                            dtype=media_item_latents.dtype,
+                        )
+
+                        media_item_latents = torch.lerp(
+                            noise, media_item_latents, strength
+                        )
+
+                        # Patchify the extra conditioning latents and calculate their pixel coordinates
+                        media_item_latents, latent_coords = self.patchifier.patchify(
+                            latents=media_item_latents
+                        )
+                        pixel_coords = latent_to_pixel_coords(
+                            latent_coords,
+                            self.vae,
+                            causal_fix=self.transformer.config.causal_temporal_positioning,
+                        )
+
+                        # Update the frame numbers to match the target frame number
+                        pixel_coords[:, 0] += media_frame_number
+                        extra_conditioning_num_latents += media_item_latents.shape[1]
+
+                        conditioning_mask = torch.full(
+                            media_item_latents.shape[:2],
+                            strength,
+                            dtype=torch.float32,
+                            device=init_latents.device,
+                        )
+
+                        extra_conditioning_latents.append(media_item_latents)
+                        extra_conditioning_pixel_coords.append(pixel_coords)
+                        extra_conditioning_mask.append(conditioning_mask)
+
+        # 3. Patchify the initial latents
+        init_latents, init_latent_coords = self.patchifier.patchify(
+            latents=init_latents
+        )
+        init_pixel_coords = latent_to_pixel_coords(
+            init_latent_coords,
+            self.vae,
+            causal_fix=self.transformer.config.causal_temporal_positioning,
+        )
+
+        # 4. Create conditioning mask for initial latents
+        if conditioning_items:
+            init_conditioning_mask, _ = self.patchifier.patchify(
+                latents=init_conditioning_mask.unsqueeze(1)
+            )
+            init_conditioning_mask = init_conditioning_mask.squeeze(-1)
+        else:
+            # No regular conditioning, create zero mask for init latents
+            init_conditioning_mask = torch.zeros(
+                init_latents.shape[:2],
+                dtype=torch.float32,
+                device=init_latents.device,
+            )
+
+        # 5. Combine all conditioning types
+        if extra_conditioning_latents:
+            # Stack the extra conditioning latents, pixel coordinates and mask
+            init_latents = torch.cat([*extra_conditioning_latents, init_latents], dim=1)
+            init_pixel_coords = torch.cat(
+                [*extra_conditioning_pixel_coords, init_pixel_coords], dim=2
+            )
+            init_conditioning_mask = torch.cat(
+                [*extra_conditioning_mask, init_conditioning_mask], dim=1
+            )
+
+            if self.transformer.use_tpu_flash_attention:
+                # When flash attention is used, keep the original number of tokens by removing tokens from the end.
+                init_latents = init_latents[:, :-extra_conditioning_num_latents]
+                init_pixel_coords = init_pixel_coords[
+                    :, :, :-extra_conditioning_num_latents
+                ]
+                init_conditioning_mask = init_conditioning_mask[
+                    :, :-extra_conditioning_num_latents
+                ]
+
+        # Return None for conditioning_mask if no conditioning was applied
+        final_conditioning_mask = (
+            init_conditioning_mask
+            if (conditioning_items or guiding_latents is not None)
+            else None
+        )
+
+        return (
+            init_latents,
+            init_pixel_coords,
+            final_conditioning_mask,
             extra_conditioning_num_latents,
         )
 

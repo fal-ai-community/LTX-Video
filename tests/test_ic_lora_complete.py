@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from ltx_video.inference import create_ltx_video_pipeline, get_device, seed_everething
 from ltx_video.models.autoencoders.vae_encode import vae_encode
+from ltx_video.pipelines.pipeline_ltx_video import ConditioningItem
+from PIL import Image
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -100,6 +102,16 @@ def load_video_frames(
     return frames_tensor
 
 
+def load_image(image_path):
+    """
+    Loads an image for conditioning.
+    """
+    image = Image.open(image_path).convert("RGB")
+    image = (torch.from_numpy(np.array(image)).float() / 127.5) - 1.0  # H W C
+    image = image.unsqueeze(0).permute(3, 0, 1, 2).unsqueeze(0)
+    return image
+
+
 def create_guiding_latents_from_depth_video(pipeline, depth_video_tensor):
     """
     Create guiding latents from a depth video using IC-LoRA.
@@ -125,7 +137,6 @@ def create_guiding_latents_from_depth_video(pipeline, depth_video_tensor):
 
         # Encode the depth video using the VAE
         logger.info("Encoding depth video with VAE...")
-        print(f"{depth_video_tensor.shape=}")
         latents = vae_encode(
             depth_video_tensor, pipeline.vae, vae_per_channel_normalize=True
         )
@@ -188,6 +199,14 @@ def run_ic_lora_generation(args):
     # Create guiding latents
     guiding_latents = create_guiding_latents_from_depth_video(pipeline, depth_video)
 
+    # Load image
+    first_frame = load_image(args.first_frame)
+    first_frame_conditioning = ConditioningItem(
+        media_item=first_frame,
+        media_frame_number=0,
+        conditioning_strength=1.0,
+    )
+
     # Generation parameters
     generation_params = {
         "height": args.height,
@@ -195,6 +214,7 @@ def run_ic_lora_generation(args):
         "num_frames": args.num_frames,
         "frame_rate": args.frame_rate,
         "prompt": args.prompt,
+        "conditioning_items": [first_frame_conditioning],
         "guiding_latents": guiding_latents,
         "guiding_latents_strength": args.guidance_strength,
         "guiding_latents_start_frame": args.start_frame,
@@ -290,6 +310,12 @@ def main():
         default="/scratch/benjamin/depth.mp4",
         help="Path to depth/structure video",
     )
+    parser.add_argument(
+        "--first_frame",
+        type=str,
+        default="/scratch/benjamin/depth-image.jpg",
+        help="Path to first frame.",
+    )
 
     # Generation parameters
     parser.add_argument(
@@ -304,7 +330,7 @@ def main():
 
     # Video dimensions
     parser.add_argument("--width", type=int, default=1280, help="Video width")
-    parser.add_argument("--height", type=int, default=720, help="Video height")
+    parser.add_argument("--height", type=int, default=704, help="Video height")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames")
     parser.add_argument("--frame_rate", type=int, default=15, help="Frame rate")
 
