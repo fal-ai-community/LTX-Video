@@ -1652,8 +1652,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     vae_per_channel_normalize=vae_per_channel_normalize,
                 ).to(dtype=init_latents.dtype)
 
-                print(f"{media_item_latents.shape=}")
-
                 # Handle the different conditioning cases
                 if conditioning_type == "guiding_latents":
                     # For guiding latents, we skip the spatial positioning logic
@@ -2043,10 +2041,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         height: int,
         width: int,
     ):
-        # Don't resize guiding latents - they're already in the correct latent space
-        if conditioning_item.conditioning_type == "guiding_latents":
-            return conditioning_item
-
         if conditioning_item.media_x or conditioning_item.media_y:
             raise ValueError(
                 "Provide media_item in the target size for spatial conditioning."
@@ -2290,6 +2284,7 @@ class LTXMultiScalePipeline:
         kwargs["width"] = downscaled_width
         kwargs["height"] = downscaled_height
         kwargs.update(**first_pass)
+
         result = self.video_pipeline(*args, **kwargs)
         latents = result.images
 
