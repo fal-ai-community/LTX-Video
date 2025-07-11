@@ -17,6 +17,14 @@ from diffusers.schedulers import DPMSolverMultistepScheduler
 from diffusers.utils import deprecate, logging, set_weights_and_activate_adapters
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    T5EncoderModel,
+    T5Tokenizer,
+)
+
 from ltx_video.models.autoencoders.causal_video_autoencoder import (
     CausalVideoAutoencoder,
 )
@@ -34,13 +42,15 @@ from ltx_video.models.transformers.transformer3d import Transformer3DModel
 from ltx_video.schedulers.rf import TimestepShifter
 from ltx_video.utils.prompt_enhance_utils import generate_cinematic_prompt
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    T5EncoderModel,
-    T5Tokenizer,
-)
+
+try:
+    import diffusers.loaders.peft as peft_module
+
+    peft_module._SET_ADAPTER_SCALE_FN_MAPPING["Transformer3DModel"] = (
+        peft_module._SET_ADAPTER_SCALE_FN_MAPPING["LTXVideoTransformer3DModel"]
+    )
+except:
+    raise
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -190,40 +200,30 @@ def retrieve_timesteps(
 @dataclass
 class ConditioningItem:
     """
-    Defines a single frame-conditioning item - a single frame or a sequence of frames.
+    Unified conditioning item for all types of conditioning in LTX-Video.
+
+    This can represent:
+    - Regular image/video conditioning (type="image" or "video")
+    - IC-LoRA guiding latents (type="guiding_latents")
+    - Any future conditioning types
 
     Attributes:
-        media_item (torch.Tensor): shape=(b, 3, f, h, w). The media item to condition on.
-        media_frame_number (int): The start-frame number of the media item in the generated video.
-        conditioning_strength (float): The strength of the conditioning (1.0 = full conditioning).
-        media_x (Optional[int]): Optional left x coordinate of the media item in the generated frame.
-        media_y (Optional[int]): Optional top y coordinate of the media item in the generated frame.
+        media_item (torch.Tensor): The conditioning data in pixel space.
+            - For all types: shape=(b, 3, f, h, w) where b=batch, f=frames, h=height, w=width
+            - Guiding latents should be passed as pixel-space videos (depth/pose/etc)
+        conditioning_type (str): Type of conditioning - "image", "video", or "guiding_latents"
+        media_frame_number (int): The start-frame number in the generated video
+        conditioning_strength (float): The strength of the conditioning (0.0-1.0)
+        media_x (Optional[int]): Optional left x coordinate (for spatial conditioning)
+        media_y (Optional[int]): Optional top y coordinate (for spatial conditioning)
     """
 
     media_item: torch.Tensor
-    media_frame_number: int
-    conditioning_strength: float
+    conditioning_type: str = "image"  # "image", "video", or "guiding_latents"
+    media_frame_number: int = 0
+    conditioning_strength: float = 1.0
     media_x: Optional[int] = None
     media_y: Optional[int] = None
-
-
-@dataclass
-class GuidingLatentsItem:
-    """
-    Defines guiding latents for in-context sampling.
-
-    Attributes:
-        latents (torch.Tensor): shape=(b, c, f, h, w). The latents to use for guiding the sampling,
-                               typically generated from an IC-LoRA model.
-        start_frame (int): The start frame number where the guiding latents should be applied.
-        strength (float): The strength of the guiding latents (1.0 = full strength).
-        blend_with_noise (bool): Whether to blend the guiding latents with noise before applying.
-    """
-
-    latents: torch.Tensor
-    start_frame: int
-    strength: float
-    blend_with_noise: bool = True
 
 
 class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
@@ -823,9 +823,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         return_dict: bool = True,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         conditioning_items: Optional[List[ConditioningItem]] = None,
-        guiding_latents: Optional[torch.FloatTensor] = None,
-        guiding_latents_strength: float = 1.0,
-        guiding_latents_start_frame: int = 0,
         decode_timestep: Union[List[float], float] = 0.0,
         decode_noise_scale: Optional[List[float]] = None,
         mixed_precision: bool = False,
@@ -915,13 +912,11 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 If set to `True`, the sampling is stochastic. If set to `False`, the sampling is deterministic.
             media_items ('torch.Tensor', *optional*):
                 The input media item used for image-to-image / video-to-video.
-            guiding_latents (`torch.FloatTensor`, *optional*):
-                Pre-computed guiding latents for in-context sampling. These latents provide structural guidance
-                during the sampling process, typically generated from IC-LoRA models. Shape should be (b, c, f, h, w).
-            guiding_latents_strength (`float`, *optional*, defaults to 1.0):
-                The strength of the guiding latents. Higher values provide stronger guidance. Range: [0.0, 1.0].
-            guiding_latents_start_frame (`int`, *optional*, defaults to 0):
-                The start frame number where the guiding latents should be applied in the generated video.
+            conditioning_items (`List[ConditioningItem]`, *optional*):
+                List of unified conditioning items that can include:
+                - Regular image/video conditioning (type="image" or "video")
+                - IC-LoRA guiding latents (type="guiding_latents")
+                Multiple IC-LoRA types (depth, pose, etc.) can be used simultaneously.
         Examples:
 
         Returns:
@@ -1130,13 +1125,10 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             vae_per_channel_normalize=vae_per_channel_normalize,
         )
 
-        # Handle both guiding latents and regular conditioning simultaneously
+        # Handle all conditioning through the unified interface
         latents, pixel_coords, conditioning_mask, num_cond_latents = (
             self.prepare_combined_conditioning(
                 conditioning_items=conditioning_items,
-                guiding_latents=guiding_latents,
-                guiding_latents_strength=guiding_latents_strength,
-                guiding_latents_start_frame=guiding_latents_start_frame,
                 init_latents=latents,
                 num_frames=num_frames,
                 height=height,
@@ -1580,9 +1572,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
     def prepare_combined_conditioning(
         self,
         conditioning_items: Optional[List[ConditioningItem]],
-        guiding_latents: Optional[torch.FloatTensor],
-        guiding_latents_strength: float,
-        guiding_latents_start_frame: int,
         init_latents: torch.Tensor,
         num_frames: int,
         height: int,
@@ -1591,16 +1580,16 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         generator=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
-        Prepare both guiding latents and regular conditioning simultaneously.
+        Prepare all types of conditioning through the unified ConditioningItem interface.
 
-        This method combines the functionality of prepare_guiding_latents and prepare_conditioning
-        to allow both types of conditioning to work together in the same generation.
+        This method processes all conditioning items (regular image/video conditioning and
+        IC-LoRA guiding latents) through a single unified interface.
 
         Args:
-            conditioning_items (Optional[List[ConditioningItem]]): Regular conditioning items (images/videos)
-            guiding_latents (Optional[torch.FloatTensor]): Pre-computed guiding latents from IC-LoRA
-            guiding_latents_strength (float): Strength of the guiding latents
-            guiding_latents_start_frame (int): Start frame for applying guiding latents
+            conditioning_items (Optional[List[ConditioningItem]]): List of conditioning items that can include:
+                - Regular image/video conditioning (type="image" or "video")
+                - IC-LoRA guiding latents (type="guiding_latents")
+                Multiple IC-LoRA types (depth, pose, etc.) can be used simultaneously
             init_latents (torch.Tensor): Initial latent tensor
             num_frames (int): Number of frames to generate
             height (int): Height of the generated video
@@ -1617,64 +1606,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         extra_conditioning_mask = []
         extra_conditioning_num_latents = 0
 
-        # 1. Handle guiding latents first (if provided)
-        if guiding_latents is not None:
-            # Validate guiding latents shape
-            batch_size, channels, guide_frames, guide_height, guide_width = (
-                guiding_latents.shape
-            )
-            assert batch_size == 1, "Guiding latents must have batch size 1"
-            assert (
-                channels == self.transformer.config.in_channels
-            ), f"Guiding latents must have {self.transformer.config.in_channels} channels"
-
-            # Ensure guiding latents are on correct device/dtype
-            guiding_latents = guiding_latents.to(
-                device=init_latents.device, dtype=init_latents.dtype
-            )
-
-            # Adjust start frame for latent space
-            latent_start_frame = guiding_latents_start_frame // self.video_scale_factor
-
-            # Blend guiding latents with noise if needed
-            if guiding_latents_strength < 1.0:
-                noise = randn_tensor(
-                    guiding_latents.shape,
-                    generator=generator,
-                    device=guiding_latents.device,
-                    dtype=guiding_latents.dtype,
-                )
-                guiding_latents = torch.lerp(
-                    noise, guiding_latents, guiding_latents_strength
-                )
-
-            # Patchify the guiding latents and calculate their pixel coordinates
-            guiding_latents_patchified, latent_coords = self.patchifier.patchify(
-                latents=guiding_latents
-            )
-            pixel_coords = latent_to_pixel_coords(
-                latent_coords,
-                self.vae,
-                causal_fix=self.transformer.config.causal_temporal_positioning,
-            )
-
-            # Update frame numbers to match the target frame number
-            pixel_coords[:, 0] += latent_start_frame
-            extra_conditioning_num_latents += guiding_latents_patchified.shape[1]
-
-            # Create conditioning mask for guiding latents
-            conditioning_mask = torch.full(
-                guiding_latents_patchified.shape[:2],
-                guiding_latents_strength,
-                dtype=torch.float32,
-                device=init_latents.device,
-            )
-
-            extra_conditioning_latents.append(guiding_latents_patchified)
-            extra_conditioning_pixel_coords.append(pixel_coords)
-            extra_conditioning_mask.append(conditioning_mask)
-
-        # 2. Handle regular conditioning items (if provided)
+        # Process all conditioning items through the unified interface
         if conditioning_items:
             assert isinstance(self.vae, CausalVideoAutoencoder)
 
@@ -1688,32 +1620,87 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
             # Process each conditioning item
             for conditioning_item in conditioning_items:
-                conditioning_item = self._resize_conditioning_item(
-                    conditioning_item, height, width
-                )
                 media_item = conditioning_item.media_item
                 media_frame_number = conditioning_item.media_frame_number
                 strength = conditioning_item.conditioning_strength
+                conditioning_type = conditioning_item.conditioning_type
+
                 assert media_item.ndim == 5  # (b, c, f, h, w)
                 b, c, n_frames, h, w = media_item.shape
+
+                # Resize conditioning item if needed (skip for guiding latents as they need special handling)
+                if conditioning_type != "guiding_latents":
+                    conditioning_item = self._resize_conditioning_item(
+                        conditioning_item, height, width
+                    )
+                    media_item = conditioning_item.media_item
+
+                # Validate dimensions
                 assert (
-                    height == h and width == w
-                ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {h}x{w} - allowed only when media_frame_number == 0"
+                    height == media_item.shape[-2] and width == media_item.shape[-1]
+                ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {media_item.shape[-2]}x{media_item.shape[-1]} - allowed only when media_frame_number == 0"
                 assert n_frames % 8 == 1
                 assert (
                     media_frame_number >= 0
                     and media_frame_number + n_frames <= num_frames
                 )
 
-                # Encode the provided conditioning media item
+                # Encode ALL conditioning media items (including guiding latents from pixel space)
                 media_item_latents = vae_encode(
                     media_item.to(dtype=self.vae.dtype, device=self.vae.device),
                     self.vae,
                     vae_per_channel_normalize=vae_per_channel_normalize,
                 ).to(dtype=init_latents.dtype)
 
-                # Handle the different conditioning cases (same logic as original prepare_conditioning)
-                if media_frame_number == 0:
+                print(f"{media_item_latents.shape=}")
+
+                # Handle the different conditioning cases
+                if conditioning_type == "guiding_latents":
+                    # For guiding latents, we skip the spatial positioning logic
+                    # and go directly to creating extra conditioning tokens
+
+                    # Adjust frame number for latent space
+                    latent_start_frame = media_frame_number // self.video_scale_factor
+
+                    # Blend with noise if needed
+                    if strength < 1.0:
+                        noise = randn_tensor(
+                            media_item_latents.shape,
+                            generator=generator,
+                            device=media_item_latents.device,
+                            dtype=media_item_latents.dtype,
+                        )
+                        media_item_latents = torch.lerp(
+                            noise, media_item_latents, strength
+                        )
+
+                    # Patchify and calculate pixel coordinates
+                    media_item_latents, latent_coords = self.patchifier.patchify(
+                        latents=media_item_latents
+                    )
+                    pixel_coords = latent_to_pixel_coords(
+                        latent_coords,
+                        self.vae,
+                        causal_fix=self.transformer.config.causal_temporal_positioning,
+                    )
+
+                    # Update frame numbers to match the target frame number
+                    pixel_coords[:, 0] += latent_start_frame
+                    extra_conditioning_num_latents += media_item_latents.shape[1]
+
+                    # Create conditioning mask
+                    conditioning_mask = torch.full(
+                        media_item_latents.shape[:2],
+                        strength,
+                        dtype=torch.float32,
+                        device=init_latents.device,
+                    )
+
+                    extra_conditioning_latents.append(media_item_latents)
+                    extra_conditioning_pixel_coords.append(pixel_coords)
+                    extra_conditioning_mask.append(conditioning_mask)
+
+                elif media_frame_number == 0:
                     # Get the target spatial position of the latent conditioning item
                     media_item_latents, l_x, l_y = self._get_latent_spatial_position(
                         media_item_latents,
@@ -1835,11 +1822,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 ]
 
         # Return None for conditioning_mask if no conditioning was applied
-        final_conditioning_mask = (
-            init_conditioning_mask
-            if (conditioning_items or guiding_latents is not None)
-            else None
-        )
+        final_conditioning_mask = init_conditioning_mask if conditioning_items else None
 
         return (
             init_latents,
@@ -2060,6 +2043,10 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         height: int,
         width: int,
     ):
+        # Don't resize guiding latents - they're already in the correct latent space
+        if conditioning_item.conditioning_type == "guiding_latents":
+            return conditioning_item
+
         if conditioning_item.media_x or conditioning_item.media_y:
             raise ValueError(
                 "Provide media_item in the target size for spatial conditioning."
@@ -2088,7 +2075,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         assert (
             h <= height and w <= width
         ), f"Conditioning item size {h}x{w} is larger than target size {height}x{width}"
-        assert h % scale == 0 and w % scale == 0
+        assert (
+            h % scale == 0 and w % scale == 0
+        ), f"Conditioning item size {h}x{w} must have both axes divisible by {scale}"
 
         # Compute the start and end spatial positions of the media item
         x_start, y_start = conditioning_item.media_x, conditioning_item.media_y
