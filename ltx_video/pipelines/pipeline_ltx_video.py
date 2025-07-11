@@ -10,41 +10,37 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from diffusers.image_processor import VaeImageProcessor
+from diffusers.loaders import LTXVideoLoraLoaderMixin
 from diffusers.models import AutoencoderKL
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from diffusers.schedulers import DPMSolverMultistepScheduler
 from diffusers.utils import deprecate, logging, set_weights_and_activate_adapters
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers.loaders import LTXVideoLoraLoaderMixin
 from einops import rearrange
-from transformers import (
-    T5EncoderModel,
-    T5Tokenizer,
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-)
-
 from ltx_video.models.autoencoders.causal_video_autoencoder import (
     CausalVideoAutoencoder,
 )
+from ltx_video.models.autoencoders.latent_upsampler import LatentUpsampler
 from ltx_video.models.autoencoders.vae_encode import (
     get_vae_size_scale_factor,
     latent_to_pixel_coords,
+    normalize_latents,
+    un_normalize_latents,
     vae_decode,
     vae_encode,
 )
 from ltx_video.models.transformers.symmetric_patchifier import Patchifier
 from ltx_video.models.transformers.transformer3d import Transformer3DModel
 from ltx_video.schedulers.rf import TimestepShifter
-from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
 from ltx_video.utils.prompt_enhance_utils import generate_cinematic_prompt
-from ltx_video.models.autoencoders.latent_upsampler import LatentUpsampler
-from ltx_video.models.autoencoders.vae_encode import (
-    un_normalize_latents,
-    normalize_latents,
+from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    T5EncoderModel,
+    T5Tokenizer,
 )
-
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -211,6 +207,25 @@ class ConditioningItem:
     media_y: Optional[int] = None
 
 
+@dataclass
+class GuidingLatentsItem:
+    """
+    Defines guiding latents for in-context sampling.
+
+    Attributes:
+        latents (torch.Tensor): shape=(b, c, f, h, w). The latents to use for guiding the sampling,
+                               typically generated from an IC-LoRA model.
+        start_frame (int): The start frame number where the guiding latents should be applied.
+        strength (float): The strength of the guiding latents (1.0 = full strength).
+        blend_with_noise (bool): Whether to blend the guiding latents with noise before applying.
+    """
+
+    latents: torch.Tensor
+    start_frame: int
+    strength: float
+    blend_with_noise: bool = True
+
+
 class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
     r"""
     Pipeline for text-to-image generation using LTX-Video.
@@ -297,19 +312,29 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         self.allowed_inference_steps = allowed_inference_steps
 
     @classmethod
-    def lora_state_dict(
-        cls,
-        pretrained_model_name_or_path_or_dict,
-        **kwargs
-    ):
-        state_dict = super().lora_state_dict(
-            pretrained_model_name_or_path_or_dict,
-            **kwargs
+    def lora_state_dict(cls, pretrained_model_name_or_path_or_dict, **kwargs):
+        state_dict_or_tuple = super().lora_state_dict(
+            pretrained_model_name_or_path_or_dict, **kwargs
         )
-        return {
+
+        is_tuple = False
+        metadata = None
+
+        if isinstance(state_dict_or_tuple, tuple):
+            state_dict, metadata = state_dict_or_tuple
+            is_tuple = True
+        else:
+            state_dict = state_dict_or_tuple
+
+        state_dict = {
             key.replace("diffusion_model.", "transformer."): value
             for key, value in state_dict.items()
         }
+
+        if is_tuple:
+            return state_dict, metadata
+
+        return state_dict
 
     def mask_text_embeddings(self, emb, mask):
         if emb.shape[0] == 1:
@@ -798,6 +823,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         return_dict: bool = True,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         conditioning_items: Optional[List[ConditioningItem]] = None,
+        guiding_latents: Optional[torch.FloatTensor] = None,
+        guiding_latents_strength: float = 1.0,
+        guiding_latents_start_frame: int = 0,
         decode_timestep: Union[List[float], float] = 0.0,
         decode_noise_scale: Optional[List[float]] = None,
         mixed_precision: bool = False,
@@ -887,6 +915,13 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 If set to `True`, the sampling is stochastic. If set to `False`, the sampling is deterministic.
             media_items ('torch.Tensor', *optional*):
                 The input media item used for image-to-image / video-to-video.
+            guiding_latents (`torch.FloatTensor`, *optional*):
+                Pre-computed guiding latents for in-context sampling. These latents provide structural guidance
+                during the sampling process, typically generated from IC-LoRA models. Shape should be (b, c, f, h, w).
+            guiding_latents_strength (`float`, *optional*, defaults to 1.0):
+                The strength of the guiding latents. Higher values provide stronger guidance. Range: [0.0, 1.0].
+            guiding_latents_start_frame (`int`, *optional*, defaults to 0):
+                The start frame number where the guiding latents should be applied in the generated video.
         Examples:
 
         Returns:
@@ -1095,18 +1130,34 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             vae_per_channel_normalize=vae_per_channel_normalize,
         )
 
-        # Update the latents with the conditioning items and patchify them into (b, n, c)
-        latents, pixel_coords, conditioning_mask, num_cond_latents = (
-            self.prepare_conditioning(
-                conditioning_items=conditioning_items,
-                init_latents=latents,
-                num_frames=num_frames,
-                height=height,
-                width=width,
-                vae_per_channel_normalize=vae_per_channel_normalize,
-                generator=generator,
+        # Handle guiding latents for in-context sampling
+        if guiding_latents is not None:
+            # Use guiding latents instead of regular conditioning
+            latents, pixel_coords, conditioning_mask, num_cond_latents = (
+                self.prepare_guiding_latents(
+                    guiding_latents=guiding_latents,
+                    guiding_latents_strength=guiding_latents_strength,
+                    guiding_latents_start_frame=guiding_latents_start_frame,
+                    init_latents=latents,
+                    num_frames=num_frames,
+                    height=height,
+                    width=width,
+                    generator=generator,
+                )
             )
-        )
+        else:
+            # Update the latents with the conditioning items and patchify them into (b, n, c)
+            latents, pixel_coords, conditioning_mask, num_cond_latents = (
+                self.prepare_conditioning(
+                    conditioning_items=conditioning_items,
+                    init_latents=latents,
+                    num_frames=num_frames,
+                    height=height,
+                    width=width,
+                    vae_per_channel_normalize=vae_per_channel_normalize,
+                    generator=generator,
+                )
+            )
         init_latents = latents.clone()  # Used for image_cond_noise_update
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -1391,6 +1442,153 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
         tokens_to_denoise_mask = (t - t_eps < (1.0 - conditioning_mask)).unsqueeze(-1)
         return torch.where(tokens_to_denoise_mask, denoised_latents, latents)
+
+    def prepare_guiding_latents(
+        self,
+        guiding_latents: Optional[torch.FloatTensor],
+        guiding_latents_strength: float,
+        guiding_latents_start_frame: int,
+        init_latents: torch.Tensor,
+        num_frames: int,
+        height: int,
+        width: int,
+        generator=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """
+        Prepare guiding latents for in-context sampling.
+
+        This method integrates pre-computed guiding latents (typically from IC-LoRA models)
+        into the sampling process to provide structural guidance.
+
+        Args:
+            guiding_latents (Optional[torch.FloatTensor]): Pre-computed guiding latents
+            guiding_latents_strength (float): Strength of the guiding latents
+            guiding_latents_start_frame (int): Start frame for applying guiding latents
+            init_latents (torch.Tensor): Initial latent tensor
+            num_frames (int): Number of frames to generate
+            height (int): Height of the generated video
+            width (int): Width of the generated video
+            generator: Random generator for noise blending
+
+        Returns:
+            Tuple containing updated latents, pixel coordinates, conditioning mask, and num extra latents
+        """
+        if guiding_latents is None:
+            # No guiding latents provided, return original latents
+            init_latents, init_pixel_coords = self.patchifier.patchify(
+                latents=init_latents
+            )
+            init_pixel_coords = latent_to_pixel_coords(
+                init_pixel_coords,
+                self.vae,
+                causal_fix=self.transformer.config.causal_temporal_positioning,
+            )
+            return init_latents, init_pixel_coords, None, 0
+
+        # Validate guiding latents shape
+        batch_size, channels, guide_frames, guide_height, guide_width = (
+            guiding_latents.shape
+        )
+        assert batch_size == 1, "Guiding latents must have batch size 1"
+        assert (
+            channels == self.transformer.config.in_channels
+        ), f"Guiding latents must have {self.transformer.config.in_channels} channels"
+
+        # Ensure guiding latents are on correct device/dtype
+        guiding_latents = guiding_latents.to(
+            device=init_latents.device, dtype=init_latents.dtype
+        )
+
+        # Adjust start frame for latent space
+        latent_start_frame = guiding_latents_start_frame // self.video_scale_factor
+
+        # Create extra conditioning latents and masks
+        extra_conditioning_latents = []
+        extra_conditioning_pixel_coords = []
+        extra_conditioning_mask = []
+        extra_conditioning_num_latents = 0
+
+        # Blend guiding latents with noise if needed
+        if guiding_latents_strength < 1.0:
+            noise = randn_tensor(
+                guiding_latents.shape,
+                generator=generator,
+                device=guiding_latents.device,
+                dtype=guiding_latents.dtype,
+            )
+            guiding_latents = torch.lerp(
+                noise, guiding_latents, guiding_latents_strength
+            )
+
+        # Patchify the guiding latents and calculate their pixel coordinates
+        guiding_latents_patchified, latent_coords = self.patchifier.patchify(
+            latents=guiding_latents
+        )
+        pixel_coords = latent_to_pixel_coords(
+            latent_coords,
+            self.vae,
+            causal_fix=self.transformer.config.causal_temporal_positioning,
+        )
+
+        # Update frame numbers to match the target frame number
+        pixel_coords[:, 0] += latent_start_frame
+        extra_conditioning_num_latents += guiding_latents_patchified.shape[1]
+
+        # Create conditioning mask for guiding latents
+        conditioning_mask = torch.full(
+            guiding_latents_patchified.shape[:2],
+            guiding_latents_strength,
+            dtype=torch.float32,
+            device=init_latents.device,
+        )
+
+        extra_conditioning_latents.append(guiding_latents_patchified)
+        extra_conditioning_pixel_coords.append(pixel_coords)
+        extra_conditioning_mask.append(conditioning_mask)
+
+        # Patchify the initial latents
+        init_latents, init_latent_coords = self.patchifier.patchify(
+            latents=init_latents
+        )
+        init_pixel_coords = latent_to_pixel_coords(
+            init_latent_coords,
+            self.vae,
+            causal_fix=self.transformer.config.causal_temporal_positioning,
+        )
+
+        # Create initial conditioning mask (no conditioning for init latents)
+        init_conditioning_mask = torch.zeros(
+            init_latents.shape[:2],
+            dtype=torch.float32,
+            device=init_latents.device,
+        )
+
+        # Combine guiding latents with initial latents
+        init_latents = torch.cat([*extra_conditioning_latents, init_latents], dim=1)
+        init_pixel_coords = torch.cat(
+            [*extra_conditioning_pixel_coords, init_pixel_coords], dim=2
+        )
+        init_conditioning_mask = torch.cat(
+            [*extra_conditioning_mask, init_conditioning_mask], dim=1
+        )
+
+        if self.transformer.use_tpu_flash_attention:
+            # When flash attention is used, keep the original number of tokens by removing
+            # tokens from the end.
+            init_latents = init_latents[:, :-extra_conditioning_num_latents]
+            init_pixel_coords = init_pixel_coords[
+                :, :, :-extra_conditioning_num_latents
+            ]
+            init_conditioning_mask = init_conditioning_mask[
+                :, :-extra_conditioning_num_latents
+            ]
+
+        return (
+            init_latents,
+            init_pixel_coords,
+            init_conditioning_mask,
+            extra_conditioning_num_latents,
+        )
 
     def prepare_conditioning(
         self,
@@ -1819,7 +2017,9 @@ class LTXMultiScalePipeline:
 
     def set_adapters(self, adapter_names, weights):
         weights = [w if w is not None else 1.0 for w in weights]
-        set_weights_and_activate_adapters(self.video_pipeline.transformer, adapter_names, weights)
+        set_weights_and_activate_adapters(
+            self.video_pipeline.transformer, adapter_names, weights
+        )
 
     def __call__(
         self,
