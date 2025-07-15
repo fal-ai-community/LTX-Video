@@ -310,7 +310,12 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 for attention_block in block.attention_blocks:
                     attention_block.set_use_tpu_flash_attention()
 
-    def enable_tiling(self, tile_sample_min_size: int = 64, patch_block: int = 4):
+    def enable_tiling(
+        self,
+        tile_sample_min_size: int = 64,
+        patch_block: int = 4,
+        use_custom_kernels: bool = True,
+    ):
         """
         Enable VAE tiling for improved memory efficiency when processing large videos.
 
@@ -320,6 +325,9 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         """
         if hasattr(self, "_tiling_enabled") and self._tiling_enabled:
             return
+
+        # Store configuration
+        self._use_custom_kernels = use_custom_kernels
 
         # Store original methods for restoration
         self._original_decoder_forward = self.decoder.forward
@@ -343,27 +351,31 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         for i, block in enumerate(reversed(self.decoder.up_blocks)):
             if i >= patch_block:
                 break
-                
+
             if block.__class__.__name__ == "UNetMidBlock3D":
                 # Store original method
                 self._original_block_forwards[id(block)] = block.forward
                 # Patch block forward
                 tiled_block = self._create_tiled_block_forward()
                 block.forward = types.MethodType(tiled_block, block)
-                
+
                 # Optimize conv weights memory layout
                 for name, param in block.named_parameters():
                     if "conv1" in name or "conv2" in name:
                         if "weight" in name:
-                            param.data = param.data.to(memory_format=torch.channels_last_3d)
-                
+                            param.data = param.data.to(
+                                memory_format=torch.channels_last_3d
+                            )
+
                 # Patch ResNet blocks
                 for res_block in block.res_blocks:
                     if res_block.__class__.__name__ == "ResnetBlock3D":
-                        self._original_res_block_forwards[id(res_block)] = res_block.forward
+                        self._original_res_block_forwards[id(res_block)] = (
+                            res_block.forward
+                        )
                         tiled_res_block = self._create_tiled_res_block_forward()
                         res_block.forward = types.MethodType(tiled_res_block, res_block)
-                        
+
             elif block.__class__.__name__ == "DepthToSpaceUpsample":
                 self._original_upsample_forwards[id(block)] = block.forward
                 tiled_upsample = self._create_tiled_upsample_forward()
@@ -407,6 +419,9 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         delattr(self, "_original_block_forwards")
         delattr(self, "_original_res_block_forwards")
         delattr(self, "_original_upsample_forwards")
+
+        if hasattr(self, "_use_custom_kernels"):
+            delattr(self, "_use_custom_kernels")
 
         self._tiling_enabled = False
         logger.info("VAE tiling disabled")
@@ -493,21 +508,48 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         Fast in-place pixel normalization with scale and shift.
         Uses optimized CUDA kernels when available.
         """
-        from .kernels.ops import pixel_norm_inplace
+        if getattr(self, "_use_custom_kernels", True):
+            try:
+                from .kernels.ops import pixel_norm_inplace
 
-        return pixel_norm_inplace(x, scale, shift, eps)
+                return pixel_norm_inplace(x, scale, shift, eps)
+            except ImportError:
+                logger.warning(
+                    "Custom kernels not available, falling back to PyTorch implementation"
+                )
+
+        # PyTorch fallback implementation
+        # Apply pixel normalization: x = (x * scale) + shift
+        if scale is not None and shift is not None:
+            x.mul_(1 + scale).add_(shift)
+        return x
 
     def _add_inplace(self, x, workspace, offset):
         """
         Fast in-place tensor addition with offset.
         Uses optimized CUDA kernels when available.
         """
-        from .kernels.ops import add_inplace
+        if getattr(self, "_use_custom_kernels", True):
+            try:
+                from .kernels.ops import add_inplace
 
-        return add_inplace(x, workspace, offset)
+                return add_inplace(x, workspace, offset)
+            except ImportError:
+                logger.warning(
+                    "Custom kernels not available, falling back to PyTorch implementation"
+                )
+
+        # PyTorch fallback implementation
+        # Add workspace to x with offset: x += workspace[:, :, offset:-offset or None, :, :]
+        if offset > 0:
+            x.add_(workspace[:, :, offset:-offset, :, :])
+        else:
+            x.add_(workspace)
+        return x
 
     def _create_tiled_res_block_forward(self):
         """Create a tiled ResNet block forward method."""
+
         def tiled_res_block_forward(
             resnet_self,
             hidden_states: torch.FloatTensor,
@@ -516,10 +558,12 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         ) -> torch.FloatTensor:
             """Tiled ResNet block forward for memory efficiency - following reference implementation."""
             batch_size = hidden_states.shape[0]
-            
+
             # Following reference implementation which assumes timestep conditioning
-            assert timestep is not None, "timestep must be provided for tiled ResNet block"
-            
+            assert (
+                timestep is not None
+            ), "timestep must be provided for tiled ResNet block"
+
             ada_values = resnet_self.scale_shift_table[None, ..., None, None, None].to(
                 timestep.device
             ) + timestep.reshape(
@@ -531,19 +575,20 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 timestep.shape[-1],
             )
             shift1, scale1, shift2, scale2 = ada_values.unbind(dim=1)
-            
-            # Apply first normalization and conv  
+
+            # Apply first normalization and conv
             self._pixel_norm_inplace(hidden_states, scale1, shift1, 1e-9)
             self._inplace_patch_conv_2(hidden_states, resnet_self.conv1.conv)
-            
+
             # Apply second normalization and conv
             self._pixel_norm_inplace(hidden_states, scale2, shift2, 1e-9)
             self._inplace_patch_conv_2(hidden_states, resnet_self.conv2.conv)
-        
+
         return tiled_res_block_forward
 
     def _create_tiled_block_forward(self):
         """Create a tiled block forward method."""
+
         def tiled_block_forward(
             block_self,
             hidden_states: torch.FloatTensor,
@@ -588,11 +633,12 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 torch.cuda.empty_cache()
 
             return hidden_states
-        
+
         return tiled_block_forward
 
     def _create_tiled_upsample_forward(self):
         """Create a tiled upsample forward method."""
+
         def tiled_upsample_forward(upsample_self, x, causal=True):
             """Tiled DepthToSpaceUpsample forward for memory efficiency - following reference implementation."""
             x_in = None
@@ -605,7 +651,10 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                     p2=upsample_self.stride[1],
                     p3=upsample_self.stride[2],
                 )
-                num_repeat = np.prod(upsample_self.stride) // upsample_self.out_channels_reduction_factor
+                num_repeat = (
+                    np.prod(upsample_self.stride)
+                    // upsample_self.out_channels_reduction_factor
+                )
                 x_in = x_in.repeat(1, num_repeat, 1, 1, 1)
 
             # Create workspace for efficient processing
@@ -638,7 +687,11 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
             )
 
             # Add residual if needed
-            if hasattr(upsample_self, "residual") and upsample_self.residual and x_in is not None:
+            if (
+                hasattr(upsample_self, "residual")
+                and upsample_self.residual
+                and x_in is not None
+            ):
                 x.add_(x_in)
                 del x_in
 
@@ -646,11 +699,12 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 torch.cuda.empty_cache()
 
             return x[:, :, 1:, :, :]
-        
+
         return tiled_upsample_forward
 
     def _create_tiled_decoder_forward(self):
         """Create a tiled decoder forward method bound to the decoder."""
+
         def tiled_decoder_forward(
             decoder_self,
             sample: torch.FloatTensor,
@@ -659,9 +713,9 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         ) -> torch.FloatTensor:
             """Tiled decoder forward for memory efficiency - following reference implementation."""
             # Handle flexible argument passing
-            target_shape = kwargs.get('target_shape') or (args[0] if args else None)
-            timestep = kwargs.get('timestep')
-            
+            target_shape = kwargs.get("target_shape") or (args[0] if args else None)
+            timestep = kwargs.get("timestep")
+
             batch_size = sample.shape[0]
 
             sample = decoder_self.conv_in(sample, causal=decoder_self.causal)
@@ -672,9 +726,9 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 assert (
                     timestep is not None
                 ), "should pass timestep with timestep_conditioning=True"
-                scaled_timestep = (timestep * decoder_self.timestep_scale_multiplier).to(
-                    sample.device
-                )
+                scaled_timestep = (
+                    timestep * decoder_self.timestep_scale_multiplier
+                ).to(sample.device)
 
             # Process up_blocks
             for up_block in decoder_self.up_blocks:
@@ -682,11 +736,13 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                     decoder_self.timestep_conditioning
                     and up_block.__class__.__name__ == "UNetMidBlock3D"
                 ):
-                    sample = up_block(sample, causal=decoder_self.causal, timestep=scaled_timestep)
+                    sample = up_block(
+                        sample, causal=decoder_self.causal, timestep=scaled_timestep
+                    )
                 else:
                     sample = up_block(sample, causal=decoder_self.causal)
 
-            # Apply final normalization and timestep conditioning  
+            # Apply final normalization and timestep conditioning
             if decoder_self.timestep_conditioning:
                 embedded_timestep = decoder_self.last_time_embedder(
                     timestep=scaled_timestep.flatten(),
@@ -698,9 +754,9 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 embedded_timestep = embedded_timestep.view(
                     batch_size, embedded_timestep.shape[-1], 1, 1, 1
                 )
-                ada_values = decoder_self.last_scale_shift_table[None, ..., None, None, None].to(
-                    embedded_timestep.device
-                ) + embedded_timestep.reshape(
+                ada_values = decoder_self.last_scale_shift_table[
+                    None, ..., None, None, None
+                ].to(embedded_timestep.device) + embedded_timestep.reshape(
                     batch_size,
                     2,
                     -1,
@@ -733,7 +789,7 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
             else:
                 workspace = decoder_self.conv_norm_out(workspace)
                 workspace = decoder_self.conv_act(workspace)
-                
+
             self._inplace_patch_conv_2(workspace, decoder_self.conv_out.conv)
 
             # Unpatchify and return
@@ -744,7 +800,7 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
             )
 
             return result
-        
+
         return tiled_decoder_forward
 
 
