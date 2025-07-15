@@ -310,20 +310,16 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 for attention_block in block.attention_blocks:
                     attention_block.set_use_tpu_flash_attention()
 
-    def enable_tiling(self, tile_sample_min_size: int = 64, patch_block: int = 4, use_custom_kernels: bool = True):
+    def enable_tiling(self, tile_sample_min_size: int = 64, patch_block: int = 4):
         """
         Enable VAE tiling for improved memory efficiency when processing large videos.
 
         Args:
             tile_sample_min_size: Minimum size for tiling
             patch_block: Number of decoder blocks to patch (from the end)
-            use_custom_kernels: Whether to use custom CUDA kernels (True) or PyTorch fallbacks (False)
         """
         if hasattr(self, "_tiling_enabled") and self._tiling_enabled:
             return
-
-        # Store configuration
-        self._use_custom_kernels = use_custom_kernels
 
         # Store original methods for restoration
         self._original_decoder_forward = self.decoder.forward
@@ -332,9 +328,8 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         self._original_upsample_forwards = {}
 
         # Patch decoder forward
-        self.decoder.forward = types.MethodType(
-            self._tiled_decoder_forward, self.decoder
-        )
+        tiled_forward = self._create_tiled_decoder_forward()
+        self.decoder.forward = types.MethodType(tiled_forward, self.decoder)
 
         # Optimize conv_out weights memory layout
         if hasattr(self.decoder.conv_out, "conv"):
@@ -344,32 +339,35 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 )
             )
 
-        # Patch up_blocks
+        # Patch up_blocks (following reference implementation)
         for i, block in enumerate(reversed(self.decoder.up_blocks)):
             if i >= patch_block:
                 break
-
-            # if block.__class__.__name__ == "UNetMidBlock3D":
-            #     # Store original method
-            #     self._original_block_forwards[id(block)] = block.forward
-            #     # Patch block forward
-            #     block.forward = types.MethodType(self._tiled_block_forward, block)
-            #
-            #     # Optimize conv weights memory layout
-            #     for name, param in block.named_parameters():
-            #         if "conv1" in name or "conv2" in name:
-            #             if "weight" in name:
-            #                 param.data = param.data.to(memory_format=torch.channels_last_3d)
-            #
-            #     # Patch ResNet blocks
-            #     for res_block in block.res_blocks:
-            #         if res_block.__class__.__name__ == "ResnetBlock3D":
-            #             self._original_res_block_forwards[id(res_block)] = res_block.forward
-            #             res_block.forward = types.MethodType(self._tiled_res_block_forward, res_block)
-
-            # elif block.__class__.__name__ == "DepthToSpaceUpsample":
-            #     self._original_upsample_forwards[id(block)] = block.forward
-            #     block.forward = types.MethodType(self._tiled_upsample_forward, block)
+                
+            if block.__class__.__name__ == "UNetMidBlock3D":
+                # Store original method
+                self._original_block_forwards[id(block)] = block.forward
+                # Patch block forward
+                tiled_block = self._create_tiled_block_forward()
+                block.forward = types.MethodType(tiled_block, block)
+                
+                # Optimize conv weights memory layout
+                for name, param in block.named_parameters():
+                    if "conv1" in name or "conv2" in name:
+                        if "weight" in name:
+                            param.data = param.data.to(memory_format=torch.channels_last_3d)
+                
+                # Patch ResNet blocks
+                for res_block in block.res_blocks:
+                    if res_block.__class__.__name__ == "ResnetBlock3D":
+                        self._original_res_block_forwards[id(res_block)] = res_block.forward
+                        tiled_res_block = self._create_tiled_res_block_forward()
+                        res_block.forward = types.MethodType(tiled_res_block, res_block)
+                        
+            elif block.__class__.__name__ == "DepthToSpaceUpsample":
+                self._original_upsample_forwards[id(block)] = block.forward
+                tiled_upsample = self._create_tiled_upsample_forward()
+                block.forward = types.MethodType(tiled_upsample, block)
 
         self._tiling_enabled = True
         logger.info("VAE tiling enabled for improved memory efficiency")
@@ -409,10 +407,6 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         delattr(self, "_original_block_forwards")
         delattr(self, "_original_res_block_forwards")
         delattr(self, "_original_upsample_forwards")
-
-        # Clean up configuration
-        if hasattr(self, "_use_custom_kernels"):
-            delattr(self, "_use_custom_kernels")
 
         self._tiling_enabled = False
         logger.info("VAE tiling disabled")
@@ -497,60 +491,36 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
     def _pixel_norm_inplace(self, x, scale, shift, eps=1e-9):
         """
         Fast in-place pixel normalization with scale and shift.
-        Uses optimized CUDA kernels when available, otherwise falls back to PyTorch.
+        Uses optimized CUDA kernels when available.
         """
-        if getattr(self, '_use_custom_kernels', True):
-            try:
-                from .kernels.ops import pixel_norm_inplace
-                return pixel_norm_inplace(x, scale, shift, eps)
-            except ImportError:
-                logger.warning("Custom kernels not available, falling back to PyTorch implementation")
-        
-        # PyTorch fallback implementation
-        # Apply pixel normalization: x = (x * scale) + shift
-        if scale is not None and shift is not None:
-            x.mul_(1 + scale).add_(shift)
-        return x
+        from .kernels.ops import pixel_norm_inplace
+
+        return pixel_norm_inplace(x, scale, shift, eps)
 
     def _add_inplace(self, x, workspace, offset):
         """
         Fast in-place tensor addition with offset.
-        Uses optimized CUDA kernels when available, otherwise falls back to PyTorch.
+        Uses optimized CUDA kernels when available.
         """
-        if getattr(self, '_use_custom_kernels', True):
-            try:
-                from .kernels.ops import add_inplace
-                return add_inplace(x, workspace, offset)
-            except ImportError:
-                logger.warning("Custom kernels not available, falling back to PyTorch implementation")
-        
-        # PyTorch fallback implementation
-        # Add workspace to x with offset: x += workspace[:, :, offset:-offset or None, :, :]
-        if offset > 0:
-            x.add_(workspace[:, :, offset:-offset, :, :])
-        else:
-            x.add_(workspace)
-        return x
+        from .kernels.ops import add_inplace
 
-    def _tiled_res_block_forward(self, *args, **kwargs):
-        """Tiled ResNet block forward for memory efficiency."""
+        return add_inplace(x, workspace, offset)
 
-        # When bound to the ResNet block, args[1] is the hidden_states tensor
-        if len(args) >= 2:
-            hidden_states = args[1]
-            causal = kwargs.get("causal", True)
-            timestep = kwargs.get("timestep", None)
-        else:
-            hidden_states = kwargs.get("hidden_states", None)
-            causal = kwargs.get("causal", True)
-            timestep = kwargs.get("timestep", None)
-
-        assert hidden_states is not None, "hidden_states must be provided"
-
-        batch_size = hidden_states.shape[0]
-
-        if self.timestep_conditioning and timestep is not None:
-            ada_values = self.scale_shift_table[None, ..., None, None, None].to(
+    def _create_tiled_res_block_forward(self):
+        """Create a tiled ResNet block forward method."""
+        def tiled_res_block_forward(
+            resnet_self,
+            hidden_states: torch.FloatTensor,
+            causal: bool = True,
+            timestep: Optional[torch.Tensor] = None,
+        ) -> torch.FloatTensor:
+            """Tiled ResNet block forward for memory efficiency - following reference implementation."""
+            batch_size = hidden_states.shape[0]
+            
+            # Following reference implementation which assumes timestep conditioning
+            assert timestep is not None, "timestep must be provided for tiled ResNet block"
+            
+            ada_values = resnet_self.scale_shift_table[None, ..., None, None, None].to(
                 timestep.device
             ) + timestep.reshape(
                 batch_size,
@@ -561,262 +531,221 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 timestep.shape[-1],
             )
             shift1, scale1, shift2, scale2 = ada_values.unbind(dim=1)
-
-            # Apply first normalization and conv
-            self._pixel_norm_inplace(hidden_states, scale1, shift1)
-            self._inplace_patch_conv_2(hidden_states, self.conv1.conv)
-
+            
+            # Apply first normalization and conv  
+            self._pixel_norm_inplace(hidden_states, scale1, shift1, 1e-9)
+            self._inplace_patch_conv_2(hidden_states, resnet_self.conv1.conv)
+            
             # Apply second normalization and conv
-            self._pixel_norm_inplace(hidden_states, scale2, shift2)
-            self._inplace_patch_conv_2(hidden_states, self.conv2.conv)
-        else:
-            # Standard path without timestep conditioning
-            hidden_states = self.norm1(hidden_states)
-            hidden_states = self.non_linearity(hidden_states)
-            self._inplace_patch_conv_2(hidden_states, self.conv1.conv)
+            self._pixel_norm_inplace(hidden_states, scale2, shift2, 1e-9)
+            self._inplace_patch_conv_2(hidden_states, resnet_self.conv2.conv)
+        
+        return tiled_res_block_forward
 
-            hidden_states = self.norm2(hidden_states)
-            hidden_states = self.non_linearity(hidden_states)
-            hidden_states = self.dropout(hidden_states)
-            self._inplace_patch_conv_2(hidden_states, self.conv2.conv)
+    def _create_tiled_block_forward(self):
+        """Create a tiled block forward method."""
+        def tiled_block_forward(
+            block_self,
+            hidden_states: torch.FloatTensor,
+            causal: bool = True,
+            timestep: Optional[torch.Tensor] = None,
+        ) -> torch.FloatTensor:
+            """Tiled UNetMidBlock3D forward for memory efficiency - following reference implementation."""
+            timestep_embed = None
+            if block_self.timestep_conditioning and timestep is not None:
+                batch_size = hidden_states.shape[0]
+                timestep_embed = block_self.time_embedder(
+                    timestep=timestep.flatten(),
+                    resolution=None,
+                    aspect_ratio=None,
+                    batch_size=batch_size,
+                    hidden_dtype=hidden_states.dtype,
+                )
+                timestep_embed = timestep_embed.view(
+                    batch_size, timestep_embed.shape[-1], 1, 1, 1
+                )
 
-    def _tiled_block_forward(self, *args, **kwargs):
-        """Tiled UNetMidBlock3D forward for memory efficiency."""
-
-        # When bound to the UNetMidBlock3D, args[1] is the hidden_states tensor
-        if len(args) >= 2:
-            hidden_states = args[1]
-            causal = kwargs.get("causal", True)
-            timestep = kwargs.get("timestep", None)
-        else:
-            hidden_states = kwargs.get("hidden_states", None)
-            causal = kwargs.get("causal", True)
-            timestep = kwargs.get("timestep", None)
-
-        assert hidden_states is not None, "hidden_states must be provided"
-
-        timestep_embed = None
-        if self.timestep_conditioning and timestep is not None:
-            batch_size = hidden_states.shape[0]
-            timestep_embed = self.time_embedder(
-                timestep=timestep.flatten(),
-                resolution=None,
-                aspect_ratio=None,
-                batch_size=batch_size,
-                hidden_dtype=hidden_states.dtype,
-            )
-            timestep_embed = timestep_embed.view(
-                batch_size, timestep_embed.shape[-1], 1, 1, 1
+            # Create workspace with padding for efficient processing
+            workspace = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                hidden_states.shape[2] + 2,
+                hidden_states.shape[3],
+                hidden_states.shape[4],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+                memory_format=torch.channels_last_3d,
             )
 
-        # Create workspace with padding for efficient processing
-        workspace = torch.empty(
-            hidden_states.shape[0],
-            hidden_states.shape[1],
-            hidden_states.shape[2] + 2,
-            hidden_states.shape[3],
-            hidden_states.shape[4],
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-            memory_format=torch.channels_last_3d,
-        )
+            # Process each ResNet block with workspace
+            for resnet in block_self.res_blocks:
+                workspace[:, :, 1:-1].copy_(hidden_states)
+                resnet(workspace, causal=causal, timestep=timestep_embed)
+                self._add_inplace(hidden_states, workspace, 1)
 
-        # Process each ResNet block with workspace
-        for resnet in self.res_blocks:
-            workspace[:, :, 1:-1].copy_(hidden_states)
-            resnet(workspace, causal=causal, timestep=timestep_embed)
-            self._add_inplace(hidden_states, workspace, 1)
+            del workspace
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        del workspace
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            return hidden_states
+        
+        return tiled_block_forward
 
-        return hidden_states
+    def _create_tiled_upsample_forward(self):
+        """Create a tiled upsample forward method."""
+        def tiled_upsample_forward(upsample_self, x, causal=True):
+            """Tiled DepthToSpaceUpsample forward for memory efficiency - following reference implementation."""
+            x_in = None
+            if hasattr(upsample_self, "residual") and upsample_self.residual:
+                # Prepare residual connection
+                x_in = rearrange(
+                    x,
+                    "b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)",
+                    p1=upsample_self.stride[0],
+                    p2=upsample_self.stride[1],
+                    p3=upsample_self.stride[2],
+                )
+                num_repeat = np.prod(upsample_self.stride) // upsample_self.out_channels_reduction_factor
+                x_in = x_in.repeat(1, num_repeat, 1, 1, 1)
 
-    def _tiled_upsample_forward(self, *args, **kwargs):
-        """Tiled DepthToSpaceUpsample forward for memory efficiency."""
+            # Create workspace for efficient processing
+            workspace = torch.empty(
+                x.shape[0],
+                upsample_self.conv.conv.out_channels,
+                x.shape[2] + 2,
+                x.shape[3],
+                x.shape[4],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            workspace[:, : x.shape[1], 1:-1, :, :].copy_(x)
+            del x
 
-        # When bound with types.MethodType, args[0] is self, args[1] is the input tensor
-        if len(args) >= 2:
-            x = args[1]  # args[1] is the input tensor
-            causal = kwargs.get("causal", True)
-        else:
-            x = kwargs.get("x", None)
-            causal = kwargs.get("causal", True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        assert x is not None, "Input tensor must be provided"
+            # Apply convolution
+            self._inplace_patch_conv_2(workspace, upsample_self.conv.conv)
+            x = workspace[:, : upsample_self.conv.conv.out_channels, 1:-1, :, :]
 
-        # Get reference to the actual upsample block - self is the VAE instance
-        # We need to find which upsample block this method was bound to
-        # For now, we'll work with the assumption that this method operates on the current block
-
-        x_in = None
-        if hasattr(self, "residual") and self.residual:
-            # Prepare residual connection
-            x_in = rearrange(
+            # Apply pixel shuffle
+            x = rearrange(
                 x,
                 "b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)",
-                p1=self.stride[0],
-                p2=self.stride[1],
-                p3=self.stride[2],
-            )
-            num_repeat = np.prod(self.stride) // self.out_channels_reduction_factor
-            x_in = x_in.repeat(1, num_repeat, 1, 1, 1)
-
-        # Create workspace for efficient processing
-        workspace = torch.empty(
-            x.shape[0],
-            self.conv.conv.out_channels,
-            x.shape[2] + 2,
-            x.shape[3],
-            x.shape[4],
-            device=x.device,
-            dtype=x.dtype,
-        )
-        workspace[:, : x.shape[1], 1:-1, :, :].copy_(x)
-        del x
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Apply convolution
-        self._inplace_patch_conv_2(workspace, self.conv.conv)
-        x = workspace[:, : self.conv.conv.out_channels, 1:-1, :, :]
-
-        # Apply pixel shuffle
-        x = rearrange(
-            x,
-            "b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)",
-            p1=self.stride[0],
-            p2=self.stride[1],
-            p3=self.stride[2],
-        )
-
-        # Add residual if needed
-        if hasattr(self, "residual") and self.residual and x_in is not None:
-            x.add_(x_in)
-            del x_in
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        return x[:, :, 1:, :, :]
-
-    def _tiled_decoder_forward(self, *args, **kwargs):
-        """Tiled decoder forward for memory efficiency."""
-
-        # When bound with types.MethodType, args[0] is self, args[1] is the sample tensor
-        if len(args) >= 2:
-            sample = args[1]  # args[1] is the sample tensor
-            # Check if target_shape is passed as positional arg[2] or in kwargs
-            if len(args) >= 3:
-                target_shape = args[2]
-                timestep = args[3] if len(args) > 3 else kwargs.get("timestep", None)
-            else:
-                target_shape = kwargs.get("target_shape", None)
-                timestep = kwargs.get("timestep", None)
-        elif len(args) == 1:
-            # Only self in args, everything else in kwargs
-            sample = kwargs.get("sample", None)
-            target_shape = kwargs.get("target_shape", None)
-            timestep = kwargs.get("timestep", None)
-        else:
-            # Everything in kwargs
-            sample = kwargs.get("sample", None)
-            target_shape = kwargs.get("target_shape", None)
-            timestep = kwargs.get("timestep", None)
-
-        assert target_shape is not None, "target_shape must be provided"
-        assert sample is not None, "sample must be provided"
-
-        # Get decoder reference - self is the VAE, decoder is self.decoder
-        decoder = self.decoder
-        batch_size = sample.shape[0]
-
-        sample = decoder.conv_in(sample, causal=decoder.causal)
-        upscale_dtype = next(iter(decoder.up_blocks.parameters())).dtype
-        sample = sample.to(upscale_dtype)
-
-        if decoder.timestep_conditioning:
-            assert (
-                timestep is not None
-            ), "should pass timestep with timestep_conditioning=True"
-            scaled_timestep = (timestep * decoder.timestep_scale_multiplier).to(
-                sample.device
+                p1=upsample_self.stride[0],
+                p2=upsample_self.stride[1],
+                p3=upsample_self.stride[2],
             )
 
-        # Process up_blocks
-        for up_block in decoder.up_blocks:
-            if (
-                decoder.timestep_conditioning
-                and up_block.__class__.__name__ == "UNetMidBlock3D"
-            ):
-                sample = up_block(
-                    sample, causal=decoder.causal, timestep=scaled_timestep
+            # Add residual if needed
+            if hasattr(upsample_self, "residual") and upsample_self.residual and x_in is not None:
+                x.add_(x_in)
+                del x_in
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return x[:, :, 1:, :, :]
+        
+        return tiled_upsample_forward
+
+    def _create_tiled_decoder_forward(self):
+        """Create a tiled decoder forward method bound to the decoder."""
+        def tiled_decoder_forward(
+            decoder_self,
+            sample: torch.FloatTensor,
+            *args,
+            **kwargs,
+        ) -> torch.FloatTensor:
+            """Tiled decoder forward for memory efficiency - following reference implementation."""
+            # Handle flexible argument passing
+            target_shape = kwargs.get('target_shape') or (args[0] if args else None)
+            timestep = kwargs.get('timestep')
+            
+            batch_size = sample.shape[0]
+
+            sample = decoder_self.conv_in(sample, causal=decoder_self.causal)
+            upscale_dtype = next(iter(decoder_self.up_blocks.parameters())).dtype
+            sample = sample.to(upscale_dtype)
+
+            if decoder_self.timestep_conditioning:
+                assert (
+                    timestep is not None
+                ), "should pass timestep with timestep_conditioning=True"
+                scaled_timestep = (timestep * decoder_self.timestep_scale_multiplier).to(
+                    sample.device
                 )
+
+            # Process up_blocks
+            for up_block in decoder_self.up_blocks:
+                if (
+                    decoder_self.timestep_conditioning
+                    and up_block.__class__.__name__ == "UNetMidBlock3D"
+                ):
+                    sample = up_block(sample, causal=decoder_self.causal, timestep=scaled_timestep)
+                else:
+                    sample = up_block(sample, causal=decoder_self.causal)
+
+            # Apply final normalization and timestep conditioning  
+            if decoder_self.timestep_conditioning:
+                embedded_timestep = decoder_self.last_time_embedder(
+                    timestep=scaled_timestep.flatten(),
+                    resolution=None,
+                    aspect_ratio=None,
+                    batch_size=sample.shape[0],
+                    hidden_dtype=sample.dtype,
+                )
+                embedded_timestep = embedded_timestep.view(
+                    batch_size, embedded_timestep.shape[-1], 1, 1, 1
+                )
+                ada_values = decoder_self.last_scale_shift_table[None, ..., None, None, None].to(
+                    embedded_timestep.device
+                ) + embedded_timestep.reshape(
+                    batch_size,
+                    2,
+                    -1,
+                    embedded_timestep.shape[-3],
+                    embedded_timestep.shape[-2],
+                    embedded_timestep.shape[-1],
+                )
+                shift, scale = ada_values.unbind(dim=1)
+
+            # Create workspace for final processing
+            workspace = torch.empty(
+                sample.shape[0],
+                sample.shape[1],
+                sample.shape[2] + 2,
+                sample.shape[3],
+                sample.shape[4],
+                device=sample.device,
+                dtype=sample.dtype,
+                memory_format=torch.channels_last_3d,
+            )
+            workspace[:, :, 1:-1, :, :].copy_(sample)
+            del sample
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Apply final normalization and convolution (following reference implementation)
+            if decoder_self.timestep_conditioning:
+                self._pixel_norm_inplace(workspace, scale, shift, 1e-9)
             else:
-                sample = up_block(sample, causal=decoder.causal)
+                workspace = decoder_self.conv_norm_out(workspace)
+                workspace = decoder_self.conv_act(workspace)
+                
+            self._inplace_patch_conv_2(workspace, decoder_self.conv_out.conv)
 
-        # Apply final normalization and timestep conditioning
-        if decoder.timestep_conditioning:
-            embedded_timestep = decoder.last_time_embedder(
-                timestep=scaled_timestep.flatten(),
-                resolution=None,
-                aspect_ratio=None,
-                batch_size=sample.shape[0],
-                hidden_dtype=sample.dtype,
+            # Unpatchify and return
+            result = unpatchify(
+                workspace[:, : decoder_self.conv_out.conv.out_channels, 1:-1],
+                patch_size_hw=decoder_self.patch_size,
+                patch_size_t=1,
             )
-            embedded_timestep = embedded_timestep.view(
-                batch_size, embedded_timestep.shape[-1], 1, 1, 1
-            )
-            ada_values = decoder.last_scale_shift_table[None, ..., None, None, None].to(
-                embedded_timestep.device
-            ) + embedded_timestep.reshape(
-                batch_size,
-                2,
-                -1,
-                embedded_timestep.shape[-3],
-                embedded_timestep.shape[-2],
-                embedded_timestep.shape[-1],
-            )
-            shift, scale = ada_values.unbind(dim=1)
-        else:
-            scale, shift = None, None
 
-        # Create workspace for final processing
-        workspace = torch.empty(
-            sample.shape[0],
-            sample.shape[1],
-            sample.shape[2] + 2,
-            sample.shape[3],
-            sample.shape[4],
-            device=sample.device,
-            dtype=sample.dtype,
-            memory_format=torch.channels_last_3d,
-        )
-        workspace[:, :, 1:-1, :, :].copy_(sample)
-        del sample
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Apply final normalization and convolution
-        if decoder.timestep_conditioning:
-            self._pixel_norm_inplace(workspace, scale, shift)
-        else:
-            workspace = decoder.conv_norm_out(workspace)
-            workspace = decoder.conv_act(workspace)
-
-        self._inplace_patch_conv_2(workspace, decoder.conv_out.conv)
-
-        # Unpatchify and return
-        result = unpatchify(
-            workspace[:, : decoder.conv_out.conv.out_channels, 1:-1],
-            patch_size_hw=decoder.patch_size,
-            patch_size_t=1,
-        )
-
-        return result
+            return result
+        
+        return tiled_decoder_forward
 
 
 class Encoder(nn.Module):
