@@ -310,16 +310,20 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 for attention_block in block.attention_blocks:
                     attention_block.set_use_tpu_flash_attention()
 
-    def enable_tiling(self, tile_sample_min_size: int = 64, patch_block: int = 4):
+    def enable_tiling(self, tile_sample_min_size: int = 64, patch_block: int = 4, use_custom_kernels: bool = True):
         """
         Enable VAE tiling for improved memory efficiency when processing large videos.
 
         Args:
             tile_sample_min_size: Minimum size for tiling
             patch_block: Number of decoder blocks to patch (from the end)
+            use_custom_kernels: Whether to use custom CUDA kernels (True) or PyTorch fallbacks (False)
         """
         if hasattr(self, "_tiling_enabled") and self._tiling_enabled:
             return
+
+        # Store configuration
+        self._use_custom_kernels = use_custom_kernels
 
         # Store original methods for restoration
         self._original_decoder_forward = self.decoder.forward
@@ -406,6 +410,10 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         delattr(self, "_original_res_block_forwards")
         delattr(self, "_original_upsample_forwards")
 
+        # Clean up configuration
+        if hasattr(self, "_use_custom_kernels"):
+            delattr(self, "_use_custom_kernels")
+
         self._tiling_enabled = False
         logger.info("VAE tiling disabled")
 
@@ -489,20 +497,40 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
     def _pixel_norm_inplace(self, x, scale, shift, eps=1e-9):
         """
         Fast in-place pixel normalization with scale and shift.
-        Uses optimized CUDA kernels when available.
+        Uses optimized CUDA kernels when available, otherwise falls back to PyTorch.
         """
-        from .kernels.ops import pixel_norm_inplace
-
-        return pixel_norm_inplace(x, scale, shift, eps)
+        if getattr(self, '_use_custom_kernels', True):
+            try:
+                from .kernels.ops import pixel_norm_inplace
+                return pixel_norm_inplace(x, scale, shift, eps)
+            except ImportError:
+                logger.warning("Custom kernels not available, falling back to PyTorch implementation")
+        
+        # PyTorch fallback implementation
+        # Apply pixel normalization: x = (x * scale) + shift
+        if scale is not None and shift is not None:
+            x.mul_(1 + scale).add_(shift)
+        return x
 
     def _add_inplace(self, x, workspace, offset):
         """
         Fast in-place tensor addition with offset.
-        Uses optimized CUDA kernels when available.
+        Uses optimized CUDA kernels when available, otherwise falls back to PyTorch.
         """
-        from .kernels.ops import add_inplace
-
-        return add_inplace(x, workspace, offset)
+        if getattr(self, '_use_custom_kernels', True):
+            try:
+                from .kernels.ops import add_inplace
+                return add_inplace(x, workspace, offset)
+            except ImportError:
+                logger.warning("Custom kernels not available, falling back to PyTorch implementation")
+        
+        # PyTorch fallback implementation
+        # Add workspace to x with offset: x += workspace[:, :, offset:-offset or None, :, :]
+        if offset > 0:
+            x.add_(workspace[:, :, offset:-offset, :, :])
+        else:
+            x.add_(workspace)
+        return x
 
     def _tiled_res_block_forward(self, *args, **kwargs):
         """Tiled ResNet block forward for memory efficiency."""
