@@ -309,7 +309,10 @@ def run_temporal_tiling_ic_lora_test(args):
         pipeline.vae,
         is_video=True,
         vae_per_channel_normalize=True,
-        timestep=torch.tensor([0.0], device=video_latents.device)  # Default timestep for decoding
+        timestep=torch.tensor([0.0], device=video_latents.device),  # Default timestep for decoding
+        use_tiling=True,
+        tile_size=(16, 16),
+        tile_stride=(14, 14),
     )
     
     # Convert from (B, C, T, H, W) to (T, H, W, C)
@@ -373,7 +376,7 @@ def main():
     parser.add_argument(
         "--depth_strength",
         type=float,
-        default=0.9,
+        default=1.0,
         help="Strength of depth guiding latents (0.0-1.0)",
     )
     parser.add_argument(
@@ -411,7 +414,7 @@ def main():
     parser.add_argument(
         "--pose_strength",
         type=float,
-        default=0.9,
+        default=1.0,
         help="Strength of pose guiding latents (0.0-1.0)",
     )
     parser.add_argument(
@@ -448,7 +451,7 @@ def main():
     parser.add_argument(
         "--temporal_overlap_strength",
         type=float,
-        default=0.6,
+        default=0.5,
         help="Conditioning strength from previous chunk",
     )
     parser.add_argument(
