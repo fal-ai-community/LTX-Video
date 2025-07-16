@@ -17,14 +17,6 @@ from diffusers.schedulers import DPMSolverMultistepScheduler
 from diffusers.utils import deprecate, logging, set_weights_and_activate_adapters
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    AutoTokenizer,
-    T5EncoderModel,
-    T5Tokenizer,
-)
-
 from ltx_video.models.autoencoders.causal_video_autoencoder import (
     CausalVideoAutoencoder,
 )
@@ -42,6 +34,13 @@ from ltx_video.models.transformers.transformer3d import Transformer3DModel
 from ltx_video.schedulers.rf import TimestepShifter
 from ltx_video.utils.prompt_enhance_utils import generate_cinematic_prompt
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    T5EncoderModel,
+    T5Tokenizer,
+)
 
 try:
     import diffusers.loaders.peft as peft_module
@@ -195,6 +194,63 @@ def retrieve_timesteps(
         num_inference_steps = len(timesteps)
 
     return timesteps, num_inference_steps
+
+
+def linear_overlap_blend(
+    existing_latents: torch.Tensor,
+    new_latents: torch.Tensor,
+    overlap_frames: int,
+    temporal_axis: int = 2,
+) -> torch.Tensor:
+    """
+    Blend new latents with existing latents using linear interpolation in the overlap region.
+
+    Args:
+        existing_latents: The existing latent tensor
+        new_latents: The new latent tensor to blend in
+        overlap_frames: Number of frames to blend over
+        temporal_axis: The temporal dimension axis
+
+    Returns:
+        Blended latent tensor
+    """
+    if overlap_frames <= 0:
+        # No overlap, just concatenate
+        return torch.cat([existing_latents, new_latents], dim=temporal_axis)
+
+    # Extract parts
+    existing_non_overlap = existing_latents.narrow(
+        temporal_axis, 0, existing_latents.size(temporal_axis) - overlap_frames
+    )
+    existing_overlap = existing_latents.narrow(
+        temporal_axis,
+        existing_latents.size(temporal_axis) - overlap_frames,
+        overlap_frames,
+    )
+    new_overlap = new_latents.narrow(temporal_axis, 0, overlap_frames)
+    new_non_overlap = new_latents.narrow(
+        temporal_axis, overlap_frames, new_latents.size(temporal_axis) - overlap_frames
+    )
+
+    # Create blending weights
+    blend_weights = torch.linspace(
+        1.0, 0.0, overlap_frames, device=existing_latents.device
+    )
+    blend_weights = (
+        blend_weights.view(1, 1, overlap_frames, 1, 1)
+        if temporal_axis == 2
+        else blend_weights
+    )
+
+    # Blend the overlap region
+    blended_overlap = existing_overlap * blend_weights + new_overlap * (
+        1.0 - blend_weights
+    )
+
+    # Concatenate all parts
+    return torch.cat(
+        [existing_non_overlap, blended_overlap, new_non_overlap], dim=temporal_axis
+    )
 
 
 @dataclass
@@ -831,9 +887,17 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         text_encoder_max_tokens: int = 256,
         stochastic_sampling: bool = False,
         media_items: Optional[torch.Tensor] = None,
+        # Temporal tiling parameters
+        temporal_tile_size: Optional[int] = None,
+        temporal_overlap: Optional[int] = None,
+        temporal_overlap_strength: float = 0.5,
+        use_guiding_latents: bool = False,
+        guiding_strength: float = 1.0,
+        temporal_adain_factor: float = 0.0,
         decode_tiling: bool = False,
         decode_tile_size: Tuple[int, int] = (64, 64),
         decode_tile_stride: Tuple[int, int] = (32, 32),
+        tone_map_compression_ratio: float = 0.0,
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         """
@@ -920,6 +984,20 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 - Regular image/video conditioning (type="image" or "video")
                 - IC-LoRA guiding latents (type="guiding")
                 Multiple IC-LoRA types (depth, pose, etc.) can be used simultaneously.
+            temporal_tile_size (`int`, *optional*):
+                Size of temporal tiles for long video generation using windowed sampling. If provided,
+                the video will be generated in overlapping temporal chunks of this size.
+            temporal_overlap (`int`, *optional*):
+                Number of frames to overlap between temporal tiles. Required if temporal_tile_size is provided.
+                Should be less than temporal_tile_size.
+            temporal_overlap_strength (`float`, *optional*, defaults to `0.5`):
+                Strength of conditioning from overlapping frames when extending video.
+            use_guiding_latents (`bool`, *optional*, defaults to `False`):
+                Whether to use conditioning_items as guiding latents for temporal tiling (e.g., IC-LoRA guides).
+            guiding_strength (`float`, *optional*, defaults to `1.0`):
+                Strength of guiding latent conditioning when use_guiding_latents is True.
+            temporal_adain_factor (`float`, *optional*, defaults to `0.0`):
+                Factor for AdaIN normalization to maintain temporal consistency across tiles (0.0 = disabled).
         Examples:
 
         Returns:
@@ -953,6 +1031,62 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
         device = self._execution_device
 
+        # Check for autoregressive pipeline
+        if temporal_tile_size is not None:
+            if temporal_overlap is None:
+                raise ValueError(
+                    "temporal_overlap must be provided when using temporal_tile_size"
+                )
+            if temporal_overlap >= temporal_tile_size:
+                raise ValueError(
+                    "temporal_overlap must be less than temporal_tile_size"
+                )
+
+            return self._autoregressive_pipeline(
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=num_inference_steps,
+                timesteps=timesteps,
+                guidance_scale=guidance_scale,
+                cfg_star_rescale=cfg_star_rescale,
+                skip_layer_strategy=skip_layer_strategy,
+                skip_block_list=skip_block_list,
+                stg_scale=stg_scale,
+                rescaling_scale=rescaling_scale,
+                guidance_timesteps=guidance_timesteps,
+                num_images_per_prompt=num_images_per_prompt,
+                eta=eta,
+                generator=generator,
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
+                output_type=output_type,
+                return_dict=return_dict,
+                callback_on_step_end=callback_on_step_end,
+                conditioning_items=conditioning_items,
+                decode_timestep=decode_timestep,
+                decode_noise_scale=decode_noise_scale,
+                mixed_precision=mixed_precision,
+                offload_to_cpu=offload_to_cpu,
+                enhance_prompt=enhance_prompt,
+                text_encoder_max_tokens=text_encoder_max_tokens,
+                stochastic_sampling=stochastic_sampling,
+                media_items=media_items,
+                temporal_tile_size=temporal_tile_size,
+                temporal_overlap=temporal_overlap,
+                temporal_overlap_strength=temporal_overlap_strength,
+                use_guiding_latents=use_guiding_latents,
+                guiding_strength=guiding_strength,
+                temporal_adain_factor=temporal_adain_factor,
+                **kwargs,
+            )
+
         self.video_scale_factor = self.video_scale_factor if is_video else 1
         vae_per_channel_normalize = kwargs.get("vae_per_channel_normalize", True)
         image_cond_noise_scale = kwargs.get("image_cond_noise_scale", 0.0)
@@ -971,7 +1105,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         )
 
         # Prepare the list of denoising time-steps
-
         retrieve_timesteps_kwargs = {}
         if isinstance(self.scheduler, TimestepShifter):
             retrieve_timesteps_kwargs["samples_shape"] = latent_shape
@@ -1140,7 +1273,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 generator=generator,
             )
         )
-        init_latents = latents.clone()  # Used for image_cond_noise_update
+
+        # Used for image_cond_noise_update
+        init_latents = latents.clone()
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1370,6 +1505,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             else:
                 decode_timestep = None
 
+            latents = self.tone_map_latents(latents, tone_map_compression_ratio)
             image = vae_decode(
                 latents,
                 self.vae,
@@ -1488,31 +1624,44 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 assert media_item.ndim == 5  # (b, c, f, h, w)
                 b, c, n_frames, h, w = media_item.shape
 
-                # Resize conditioning item if needed
-                conditioning_item = self._resize_conditioning_item(
-                    conditioning_item, height, width
-                )
-                media_item = conditioning_item.media_item
-
-                # Validate dimensions
-                assert (
-                    height == media_item.shape[-2] and width == media_item.shape[-1]
-                ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {media_item.shape[-2]}x{media_item.shape[-1]} - allowed only when media_frame_number == 0"
-                assert n_frames % 8 == 1
-                assert (
-                    media_frame_number >= 0
-                    and media_frame_number + n_frames <= num_frames
+                # Check if media item is already in latent space (more than 3 channels indicates encoded)
+                is_already_encoded = c > 3
+                logger.debug(
+                    f"DEBUG: Processing conditioning type={conditioning_type}, shape={media_item.shape}, channels={c}, is_encoded={is_already_encoded}"
                 )
 
-                # Encode ALL conditioning media items
-                media_item_latents = vae_encode(
-                    media_item.to(dtype=self.vae.dtype, device=self.vae.device),
-                    self.vae,
-                    vae_per_channel_normalize=vae_per_channel_normalize,
-                ).to(dtype=init_latents.dtype)
+                if is_already_encoded:
+                    # Media item is already in latent space, use directly
+                    media_item_latents = media_item.to(dtype=init_latents.dtype)
+                    logger.debug(
+                        f"Using pre-encoded guiding latents: {media_item.shape}, frame_number={media_frame_number}"
+                    )
+                else:
+                    # Resize conditioning item if needed
+                    conditioning_item = self._resize_conditioning_item(
+                        conditioning_item, height, width
+                    )
+                    media_item = conditioning_item.media_item
+
+                    # Validate dimensions for pixel-space items
+                    assert (
+                        height == media_item.shape[-2] and width == media_item.shape[-1]
+                    ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {media_item.shape[-2]}x{media_item.shape[-1]} - allowed only when media_frame_number == 0"
+                    assert n_frames % 8 == 1
+                    assert (
+                        media_frame_number >= 0
+                        and media_frame_number + n_frames <= num_frames
+                    )
+
+                    # Encode pixel-space conditioning media items
+                    media_item_latents = vae_encode(
+                        media_item.to(dtype=self.vae.dtype, device=self.vae.device),
+                        self.vae,
+                        vae_per_channel_normalize=vae_per_channel_normalize,
+                    ).to(dtype=init_latents.dtype)
 
                 # Handle the different conditioning cases
-                if conditioning_type == "guiding":
+                if conditioning_type in ["guiding", "guiding_latents"]:
                     # For guiding latents, we skip the spatial positioning logic
                     # and go directly to creating extra conditioning tokens
 
@@ -1579,6 +1728,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     init_conditioning_mask[
                         :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l
                     ] = strength
+
                 else:
                     # Non-first frame or sequence
                     if n_frames > 1:
@@ -2054,6 +2204,465 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         # Trim down to a multiple of temporal_scale_factor frames plus 1
         num_frames = (num_frames - 1) // scale_factor * scale_factor + 1
         return num_frames
+
+    def _combine_temporal_chunks(
+        self,
+        output_chunks: List,
+        chunk_starts: List[int],
+        chunk_ends: List[int],
+        temporal_overlap: int,
+        output_type: str = "pil",
+    ):
+        """
+        Combine temporal chunks with proper overlap blending.
+
+        Args:
+            output_chunks: List of pipeline outputs for each chunk
+            chunk_starts: Start frame for each chunk
+            chunk_ends: End frame for each chunk
+            temporal_overlap: Number of frames to overlap
+            output_type: Output type (pil, pt, latent)
+
+        Returns:
+            Combined output
+        """
+        if len(output_chunks) == 1:
+            # Single chunk, return as-is
+            chunk = output_chunks[0]
+            if hasattr(chunk, "images"):
+                return chunk.images
+            elif isinstance(chunk, tuple):
+                return chunk[0]
+            else:
+                return chunk
+
+        # Extract latents from each chunk
+        chunk_latents = []
+        for chunk in output_chunks:
+            if hasattr(chunk, "images"):
+                chunk_latents.append(chunk.images)
+            elif isinstance(chunk, tuple):
+                chunk_latents.append(chunk[0])
+            else:
+                chunk_latents.append(chunk)
+
+        # Combine chunks with overlap blending in latent space
+        combined_latents = chunk_latents[0]  # Start with first chunk
+
+        for i in range(1, len(chunk_latents)):
+            current_chunk = chunk_latents[i]
+
+            # Calculate overlap in latent space
+            latent_overlap_frames = temporal_overlap // self.video_scale_factor
+            if isinstance(self.vae, CausalVideoAutoencoder):
+                latent_overlap_frames = max(1, latent_overlap_frames)
+
+            # Blend the chunks
+            combined_latents = linear_overlap_blend(
+                combined_latents, current_chunk, latent_overlap_frames, temporal_axis=2
+            )
+
+        return combined_latents
+
+    def _autoregressive_pipeline(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        temporal_tile_size: int,
+        temporal_overlap: int,
+        temporal_overlap_strength: float = 0.5,
+        use_guiding_latents: bool = False,
+        guiding_strength: float = 1.0,
+        temporal_adain_factor: float = 0.0,
+        **kwargs,
+    ):
+        """
+        Generate video using temporal tiling and autoregressive sampling.
+        This properly implements the LTXVLoopingSampler approach by:
+        1. Running complete denoising processes on temporal chunks
+        2. Using previous chunk results as conditioning for subsequent chunks
+        3. Each chunk goes through the full denoising pipeline (all timesteps)
+        """
+        is_video = kwargs.get("is_video", True)
+        device = self._execution_device
+
+        # Calculate temporal chunks (in pixel frames, not latent frames)
+        if num_frames < temporal_tile_size:
+            # No need for tiling if the video is smaller than tile size
+            kwargs.pop("temporal_tile_size", None)
+            kwargs.pop("temporal_overlap", None)
+            return self.__call__(
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                **kwargs,
+            )
+
+        # Calculate chunk boundaries in pixel space
+        chunk_starts = list(range(0, num_frames, temporal_tile_size - temporal_overlap))
+        chunk_ends = [
+            min(start + temporal_tile_size, num_frames) for start in chunk_starts
+        ]
+
+        # Remove last chunk if it's too small or adjust it
+        if (
+            len(chunk_starts) > 1
+            and chunk_ends[-1] - chunk_starts[-1] < temporal_overlap
+        ):
+            chunk_starts = chunk_starts[:-1]
+            chunk_ends = chunk_ends[:-1]
+            chunk_ends[-1] = num_frames
+
+        logger.debug(f"Temporal tiling: {len(chunk_starts)} chunks")
+        for i, (start, end) in enumerate(zip(chunk_starts, chunk_ends)):
+            logger.debug(f"  Chunk {i+1}: frames {start}-{end} ({end-start} frames)")
+
+        # Store original generator state for reproducibility
+        original_generator_state = None
+        if kwargs.get("generator") is not None:
+            original_generator_state = kwargs["generator"].get_state()
+
+        output_chunks = []
+        first_chunk_result = None  # For AdaIN reference
+
+        for chunk_idx, (start_frame, end_frame) in enumerate(
+            zip(chunk_starts, chunk_ends)
+        ):
+            chunk_num_frames = end_frame - start_frame
+
+            logger.debug(
+                f"Processing chunk {chunk_idx + 1}/{len(chunk_starts)}: frames {start_frame}-{end_frame}"
+            )
+
+            # Prepare chunk-specific parameters
+            chunk_kwargs = kwargs.copy()
+            # Remove temporal tiling parameters to prevent recursion
+            chunk_kwargs.pop("temporal_tile_size", None)
+            chunk_kwargs.pop("temporal_overlap", None)
+            chunk_kwargs.pop("temporal_overlap_strength", None)
+            chunk_kwargs.pop("use_guiding_latents", None)
+            chunk_kwargs.pop("guiding_strength", None)
+            chunk_kwargs.pop("temporal_adain_factor", None)
+
+            # Set deterministic seed for each chunk
+            if kwargs.get("generator") is not None:
+                chunk_kwargs["generator"].manual_seed(
+                    kwargs["generator"].initial_seed() + start_frame
+                )
+
+            # Prepare conditioning for this chunk
+            chunk_conditioning_items = []
+
+            # Add overlap conditioning from previous chunk (if not first chunk)
+            if chunk_idx > 0 and output_chunks:
+                # Extract overlap region from previous chunk
+                prev_chunk = output_chunks[-1]
+                overlap_frames = temporal_overlap
+
+                # Get the last 'overlap_frames' from previous chunk as conditioning
+                if hasattr(prev_chunk, "images"):
+                    prev_latents = prev_chunk.images
+                else:
+                    prev_latents = (
+                        prev_chunk[0] if isinstance(prev_chunk, tuple) else prev_chunk
+                    )
+
+                # Get overlap region in latent space
+                latent_overlap_frames = overlap_frames // self.video_scale_factor
+                if isinstance(self.vae, CausalVideoAutoencoder):
+                    # Account for causal VAE structure
+                    latent_overlap_frames = max(1, latent_overlap_frames)
+
+                overlap_latents = prev_latents[:, :, -latent_overlap_frames:]
+
+                try:
+                    overlap_pixels = vae_decode(
+                        overlap_latents,
+                        self.vae,
+                        is_video=True,
+                        vae_per_channel_normalize=kwargs.get(
+                            "vae_per_channel_normalize", True
+                        ),
+                        timestep=torch.tensor([0.0], device=overlap_latents.device),
+                    )
+
+                    # Create conditioning item for overlap - Updated to use new approach
+                    overlap_item = ConditioningItem(
+                        media_item=overlap_pixels,
+                        conditioning_type="video",
+                        media_frame_number=0,  # Condition at start of new chunk
+                        conditioning_strength=temporal_overlap_strength,
+                    )
+                    chunk_conditioning_items.append(overlap_item)
+                    logger.debug(f"  Added overlap conditioning: {overlap_pixels.shape}")
+
+                except Exception as e:
+                    logger.debug(f"  Warning: Failed to create overlap conditioning: {e}")
+
+            # Add guiding latents for this chunk if specified
+            if use_guiding_latents and kwargs.get("conditioning_items"):
+                for item in kwargs["conditioning_items"]:
+                    if item.conditioning_type in ["guiding", "guiding_latents"]:
+                        # First, encode the guiding video to latent space if not already done
+                        if not hasattr(item, "_encoded_latents"):
+                            item._encoded_latents = vae_encode(
+                                item.media_item.to(
+                                    dtype=self.vae.dtype, device=self.vae.device
+                                ),
+                                self.vae,
+                                vae_per_channel_normalize=kwargs.get(
+                                    "vae_per_channel_normalize", True
+                                ),
+                            ).to(dtype=torch.float32)
+                            logger.debug(
+                                f"  Encoded guiding video: {item.media_item.shape} -> {item._encoded_latents.shape}"
+                            )
+
+                        # Now work in latent space for all calculations
+                        latent_item_start_frame = (
+                            item.media_frame_number // self.video_scale_factor
+                        )
+                        latent_item_end_frame = (
+                            latent_item_start_frame + item._encoded_latents.shape[2]
+                        )
+                        latent_chunk_start = start_frame // self.video_scale_factor
+                        latent_chunk_end = (
+                            latent_chunk_start
+                            + (chunk_num_frames - 1) // self.video_scale_factor
+                            + 1
+                        )
+
+                        # Check if this guiding item overlaps with current chunk (in latent space)
+                        if (
+                            latent_item_start_frame < latent_chunk_end
+                            and latent_item_end_frame > latent_chunk_start
+                        ):
+                            # Calculate overlap region in latent space
+                            chunk_start_in_item = max(
+                                0, latent_chunk_start - latent_item_start_frame
+                            )
+                            chunk_end_in_item = min(
+                                item._encoded_latents.shape[2],
+                                chunk_start_in_item
+                                + (latent_chunk_end - latent_chunk_start),
+                            )
+
+                            if chunk_end_in_item > chunk_start_in_item:
+                                # Ensure frame count satisfies n_frames % 8 == 1
+                                extracted_frames = (
+                                    chunk_end_in_item - chunk_start_in_item
+                                )
+                                if extracted_frames % 8 != 1:
+                                    adjusted_frames = (
+                                        (extracted_frames - 1) // 8
+                                    ) * 8 + 1
+                                    if adjusted_frames < 1:
+                                        adjusted_frames = 1
+                                    chunk_end_in_item = (
+                                        chunk_start_in_item + adjusted_frames
+                                    )
+                                    chunk_end_in_item = min(
+                                        chunk_end_in_item, item.media_item.shape[2]
+                                    )
+
+                            if chunk_end_in_item > chunk_start_in_item:
+                                # Extract the relevant portion from encoded latents
+                                chunk_item = copy.deepcopy(item)
+                                chunk_item.media_item = item._encoded_latents[
+                                    :, :, chunk_start_in_item:chunk_end_in_item
+                                ]
+                                # Convert back to pixel space for frame number
+                                chunk_item.media_frame_number = max(
+                                    0,
+                                    (latent_item_start_frame - latent_chunk_start)
+                                    * self.video_scale_factor,
+                                )
+                                chunk_item.conditioning_strength = guiding_strength
+                                chunk_conditioning_items.append(chunk_item)
+                                logger.debug(
+                                    f"  Added guiding conditioning: {chunk_item.media_item.shape} (latent space, chunk {chunk_idx+1})"
+                                )
+
+            # Add other conditioning items (like first frame conditioning)
+            if kwargs.get("conditioning_items"):
+                for item in kwargs["conditioning_items"]:
+                    if item.conditioning_type not in ["guiding", "guiding_latents"]:
+                        # First frame conditioning should ONLY apply to the first chunk
+                        if (
+                            item.conditioning_type == "image"
+                            and item.media_frame_number == 0
+                        ):
+                            # Only include first frame conditioning in the first chunk
+                            if chunk_idx == 0:
+                                chunk_conditioning_items.append(item)
+                            # Skip first frame conditioning for all other chunks
+                        else:
+                            # Include other regular conditioning items if they apply to this chunk
+                            # Adjust frame number relative to chunk start
+                            item_frame_in_chunk = item.media_frame_number - start_frame
+                            if 0 <= item_frame_in_chunk < chunk_num_frames:
+                                # Create a copy with adjusted frame number
+                                chunk_item = copy.deepcopy(item)
+                                chunk_item.media_frame_number = item_frame_in_chunk
+                                chunk_conditioning_items.append(chunk_item)
+                    # Note: guiding items are handled above and should not be included here to avoid duplication
+
+            chunk_kwargs["conditioning_items"] = (
+                chunk_conditioning_items if chunk_conditioning_items else None
+            )
+
+            if chunk_idx > 0:
+                # For extension chunks, we can optionally provide initialization latents
+                # This is particularly useful when we want to initialize the new chunk
+                # with some prior knowledge or when extending from previous results
+
+                # Create empty latents for the new chunk if no other initialization is provided
+                latent_height = height // self.vae_scale_factor
+                latent_width = width // self.vae_scale_factor
+                latent_num_frames = chunk_num_frames // self.video_scale_factor
+                if isinstance(self.vae, CausalVideoAutoencoder) and is_video:
+                    latent_num_frames += 1
+
+                batch_size = (
+                    kwargs.get("prompt_embeds", torch.ones(1, 1, 1)).shape[0]
+                    if kwargs.get("prompt_embeds") is not None
+                    else 1
+                )
+                num_images_per_prompt = kwargs.get("num_images_per_prompt", 1)
+
+                init_latent_shape = (
+                    batch_size * num_images_per_prompt,
+                    self.transformer.config.in_channels,
+                    latent_num_frames,
+                    latent_height,
+                    latent_width,
+                )
+
+                # Prepare initialization latents for this chunk
+                chunk_init_latents = self.prepare_latents(
+                    latents=None,  # No existing latents for extension chunks
+                    media_items=None,  # No media items for extension chunks
+                    timestep=1.0,  # Full noise for new content
+                    latent_shape=init_latent_shape,
+                    dtype=torch.float32,
+                    device=device,
+                    generator=chunk_kwargs.get("generator"),
+                    vae_per_channel_normalize=kwargs.get(
+                        "vae_per_channel_normalize", True
+                    ),
+                )
+
+                # Store initialization latents for potential use in conditioning
+                chunk_kwargs["_chunk_init_latents"] = chunk_init_latents
+
+            # Run complete denoising process for this chunk
+            result = self.__call__(
+                height=height,
+                width=width,
+                num_frames=chunk_num_frames,
+                frame_rate=frame_rate,
+                **chunk_kwargs,
+            )
+
+            # Apply AdaIN if enabled and we have a reference
+            if (
+                temporal_adain_factor > 0
+                and chunk_idx > 0
+                and first_chunk_result is not None
+            ):
+                if hasattr(result, "images"):
+                    current_latents = result.images
+                else:
+                    current_latents = result[0] if isinstance(result, tuple) else result
+
+                if hasattr(first_chunk_result, "images"):
+                    reference_latents = first_chunk_result.images
+                else:
+                    reference_latents = (
+                        first_chunk_result[0]
+                        if isinstance(first_chunk_result, tuple)
+                        else first_chunk_result
+                    )
+
+                # Apply AdaIN
+                current_latents = adain_filter_latent(
+                    current_latents, reference_latents, temporal_adain_factor
+                )
+
+                # Update result
+                if hasattr(result, "images"):
+                    result.images = current_latents
+                elif isinstance(result, tuple):
+                    result = (current_latents,) + result[1:]
+                else:
+                    result = current_latents
+
+            output_chunks.append(result)
+
+            # Store first chunk as reference for AdaIN
+            if chunk_idx == 0:
+                first_chunk_result = result
+
+        # Restore original generator state
+        if original_generator_state is not None:
+            kwargs["generator"].set_state(original_generator_state)
+
+        # Combine chunks with overlap blending
+        logger.debug("Combining chunks with temporal blending...")
+        final_output = self._combine_temporal_chunks(
+            output_chunks,
+            chunk_starts,
+            chunk_ends,
+            temporal_overlap,
+            output_type=kwargs.get("output_type", "pil"),
+        )
+
+        # Return in the same format as the original pipeline
+        if kwargs.get("return_dict", True):
+            return ImagePipelineOutput(images=final_output)
+        else:
+            return (final_output,)
+
+    @staticmethod
+    def tone_map_latents(
+        latents: torch.Tensor,
+        compression: float,
+    ) -> torch.Tensor:
+        """
+        Applies a non-linear tone-mapping function to latent values to reduce their dynamic range
+        in a perceptually smooth way using a sigmoid-based compression.
+        This is useful for regularizing high-variance latents or for conditioning outputs
+        during generation, especially when controlling dynamic behavior with a `compression` factor.
+        Parameters:
+        ----------
+        latents : torch.Tensor
+            Input latent tensor with arbitrary shape. Expected to be roughly in [-1, 1] or [0, 1] range.
+        compression : float
+            Compression strength in the range [0, 1].
+            - 0.0: No tone-mapping (identity transform)
+            - 1.0: Full compression effect
+        Returns:
+        -------
+        torch.Tensor
+            The tone-mapped latent tensor of the same shape as input.
+        """
+        if not (0 <= compression <= 1):
+            raise ValueError("Compression must be in the range [0, 1]")
+
+        # Remap [0-1] to [0-0.75] and apply sigmoid compression in one shot
+        scale_factor = compression * 0.75
+        abs_latents = torch.abs(latents)
+
+        # Sigmoid compression: sigmoid shifts large values toward 0.2, small values stay ~1.0
+        # When scale_factor=0, sigmoid term vanishes, when scale_factor=0.75, full effect
+        sigmoid_term = torch.sigmoid(4.0 * scale_factor * (abs_latents - 1.0))
+        scales = 1.0 - 0.8 * scale_factor * sigmoid_term
+
+        filtered = latents * scales
+        return filtered
 
 
 def adain_filter_latent(
