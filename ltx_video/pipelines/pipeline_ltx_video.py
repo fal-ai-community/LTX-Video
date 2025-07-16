@@ -2882,10 +2882,12 @@ class LTXMultiScalePipeline:
 
         kwargs = original_kwargs
 
+        second_pass_height = downscaled_height * 2
+        second_pass_width = downscaled_width * 2
         kwargs["latents"] = upsampled_latents
         kwargs["output_type"] = original_output_type
-        kwargs["width"] = downscaled_width * 2
-        kwargs["height"] = downscaled_height * 2
+        kwargs["width"] = second_pass_width
+        kwargs["height"] = second_pass_height
         kwargs["conditioning_items"] = self._resize_conditioning_items_for_pass(
             original_conditioning_items, second_pass_height, second_pass_width
         )
