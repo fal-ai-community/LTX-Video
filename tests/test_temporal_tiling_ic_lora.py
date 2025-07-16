@@ -19,8 +19,8 @@ import imageio
 import numpy as np
 import torch
 from einops import rearrange
-from ltx_video.inference import create_ltx_video_pipeline, get_device, seed_everething
-from ltx_video.pipelines.pipeline_ltx_video import ConditioningItem
+from ltx_video.inference import create_ltx_video_pipeline, get_device, seed_everething, create_latent_upsampler
+from ltx_video.pipelines.pipeline_ltx_video import ConditioningItem, LTXMultiScalePipeline
 from PIL import Image
 
 # Setup logging
@@ -109,6 +109,7 @@ def load_image(image_path):
     image = (torch.from_numpy(np.array(image)).float() / 127.5) - 1.0
     image = rearrange(image, "h w c -> 1 c 1 h w")
     image = torch.clamp(image, -1.0, 1.0)
+    print(f"{image.shape=} {image.dtype=}")
     return image
 
 
@@ -139,6 +140,17 @@ def run_temporal_tiling_ic_lora_test(args):
         device=device,
         enhance_prompt=False,
     )
+
+    if args.upsampler_model_path:
+        logger.info(f"📦 Loading Latent Upsampler from {args.upsampler_model_path}")
+        upsampler = create_latent_upsampler(
+            args.upsampler_model_path,
+            device=device
+        )
+        pipeline = LTXMultiScalePipeline(
+            pipeline,
+            upsampler
+        )
 
     # Prepare conditioning items
     conditioning_items = []
@@ -267,7 +279,13 @@ def run_temporal_tiling_ic_lora_test(args):
         "use_guiding_latents": args.use_guiding_latents,
         "guiding_strength": args.guiding_strength,
         "temporal_adain_factor": args.temporal_adain_factor,
+        "tone_map_compression_ratio": 0.5,
     }
+
+    if args.upsampler_model_path:
+        generation_params["downscale_factor"] = 0.66667
+        generation_params["first_pass"] = {"skip_final_inference_steps": int(2 * args.num_inference_steps // 5)}
+        generation_params["second_pass"] = {"skip_initial_inference_steps": int(3 * args.num_inference_steps // 5)}
 
     # Add optional parameters
     if args.negative_prompt:
@@ -346,6 +364,12 @@ def main():
         type=str,
         required=True,
         help="Path to LTX-Video model checkpoint (.safetensors)",
+    )
+    parser.add_argument(
+        "--upsampler_model_path",
+        type=str,
+        default="",
+        help="Path to LTX-Video upsampler model checkpoint (.safetensors)",
     )
     parser.add_argument(
         "--text_encoder_path",

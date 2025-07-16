@@ -897,6 +897,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         decode_tiling: bool = False,
         decode_tile_size: Tuple[int, int] = (64, 64),
         decode_tile_stride: Tuple[int, int] = (32, 32),
+        tone_map_compression_ratio: float = 0.0,
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         """
@@ -1004,6 +1005,10 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 If `return_dict` is `True`, [`~pipelines.ImagePipelineOutput`] is returned, otherwise a `tuple` is
                 returned where the first element is a list with the generated images
         """
+        print(f"{timesteps=}")
+        print(f"{skip_initial_inference_steps=}")
+        print(f"{skip_final_inference_steps=}")
+
         if "mask_feature" in kwargs:
             deprecation_message = "The use of `mask_feature` is deprecated. It is no longer used in any computation and that doesn't affect the end results. It will be removed in a future version."
             deprecate("mask_feature", "1.0.0", deprecation_message, standard_warn=False)
@@ -1084,6 +1089,8 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 use_guiding_latents=use_guiding_latents,
                 guiding_strength=guiding_strength,
                 temporal_adain_factor=temporal_adain_factor,
+                skip_initial_inference_steps=skip_initial_inference_steps,
+                skip_final_inference_steps=skip_final_inference_steps,
                 **kwargs,
             )
 
@@ -1096,6 +1103,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         latent_num_frames = num_frames // self.video_scale_factor
         if isinstance(self.vae, CausalVideoAutoencoder) and is_video:
             latent_num_frames += 1
+
         latent_shape = (
             batch_size * num_images_per_prompt,
             self.transformer.config.in_channels,
@@ -1197,6 +1205,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 max_new_tokens=text_encoder_max_tokens,
             )
 
+        print(f"{timesteps=}")
+        print(f"{skip_initial_inference_steps=}")
+        print(f"{skip_final_inference_steps=}")
         # 3. Encode input prompt
         if self.text_encoder is not None:
             self.text_encoder = self.text_encoder.to(self._execution_device)
@@ -1274,7 +1285,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 generator=generator,
             )
         )
-        init_latents = latents.clone()  # Used for image_cond_noise_update
+
+        # Used for image_cond_noise_update
+        init_latents = latents.clone()
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -1504,6 +1517,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             else:
                 decode_timestep = None
 
+            latents = self.tone_map_latents(latents, tone_map_compression_ratio)
             image = vae_decode(
                 latents,
                 self.vae,
@@ -1705,6 +1719,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     extra_conditioning_mask.append(conditioning_mask)
 
                 elif media_frame_number == 0:
+                    # Use the working first frame conditioning approach from pipeline_ltx_video_before.py
                     # Get the target spatial position of the latent conditioning item
                     media_item_latents, l_x, l_y = self._get_latent_spatial_position(
                         media_item_latents,
@@ -1726,6 +1741,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     init_conditioning_mask[
                         :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l
                     ] = strength
+
                 else:
                     # Non-first frame or sequence
                     if n_frames > 1:
@@ -2368,9 +2384,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         prev_chunk[0] if isinstance(prev_chunk, tuple) else prev_chunk
                     )
 
-                # Decode overlap region to pixel space for conditioning
-                from ltx_video.models.autoencoders.vae_encode import vae_decode
-
                 # Get overlap region in latent space
                 latent_overlap_frames = overlap_frames // self.video_scale_factor
                 if isinstance(self.vae, CausalVideoAutoencoder):
@@ -2390,7 +2403,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         timestep=torch.tensor([0.0], device=overlap_latents.device),
                     )
 
-                    # Create conditioning item for overlap
+                    # Create conditioning item for overlap - Updated to use new approach
                     overlap_item = ConditioningItem(
                         media_item=overlap_pixels,
                         conditioning_type="video",
@@ -2409,10 +2422,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     if item.conditioning_type in ["guiding", "guiding_latents"]:
                         # First, encode the guiding video to latent space if not already done
                         if not hasattr(item, "_encoded_latents"):
-                            from ltx_video.models.autoencoders.vae_encode import (
-                                vae_encode,
-                            )
-
                             item._encoded_latents = vae_encode(
                                 item.media_item.to(
                                     dtype=self.vae.dtype, device=self.vae.device
@@ -2495,14 +2504,107 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             if kwargs.get("conditioning_items"):
                 for item in kwargs["conditioning_items"]:
                     if item.conditioning_type not in ["guiding", "guiding_latents"]:
-                        # Include regular conditioning items for first chunk or if they apply to this chunk
-                        if chunk_idx == 0 or item.media_frame_number < chunk_num_frames:
-                            chunk_conditioning_items.append(item)
+                        # First frame conditioning should ONLY apply to the first chunk
+                        if (
+                            item.conditioning_type == "image"
+                            and item.media_frame_number == 0
+                        ):
+                            # Only include first frame conditioning in the first chunk
+                            if chunk_idx == 0:
+                                chunk_conditioning_items.append(item)
+                            # Skip first frame conditioning for all other chunks
+                        else:
+                            # Include other regular conditioning items if they apply to this chunk
+                            # Adjust frame number relative to chunk start
+                            item_frame_in_chunk = item.media_frame_number - start_frame
+                            if 0 <= item_frame_in_chunk < chunk_num_frames:
+                                # Create a copy with adjusted frame number
+                                chunk_item = copy.deepcopy(item)
+                                chunk_item.media_frame_number = item_frame_in_chunk
+                                chunk_conditioning_items.append(chunk_item)
                     # Note: guiding items are handled above and should not be included here to avoid duplication
 
             chunk_kwargs["conditioning_items"] = (
                 chunk_conditioning_items if chunk_conditioning_items else None
             )
+
+            # Handle initialization latents for this chunk
+            if kwargs.get("latents") is not None:
+                # If we have initialization latents, slice them for this chunk
+                full_latents = kwargs["latents"]
+
+                # Calculate latent space dimensions for this chunk
+                latent_height = height // self.vae_scale_factor
+                latent_width = width // self.vae_scale_factor
+                latent_chunk_start = start_frame // self.video_scale_factor
+                latent_chunk_frames = chunk_num_frames // self.video_scale_factor
+                if isinstance(self.vae, CausalVideoAutoencoder) and is_video:
+                    latent_chunk_frames += 1
+
+                latent_chunk_end = latent_chunk_start + latent_chunk_frames
+
+                # Ensure we don't exceed the bounds of the full latents
+                latent_chunk_end = min(latent_chunk_end, full_latents.shape[2])
+                actual_latent_frames = latent_chunk_end - latent_chunk_start
+
+                if actual_latent_frames > 0:
+                    # Slice the latents for this chunk
+                    chunk_latents = full_latents[
+                        :, :, latent_chunk_start:latent_chunk_end
+                    ]
+                    chunk_kwargs["latents"] = chunk_latents
+                    print(
+                        f"  Using sliced latents: {chunk_latents.shape} (from {latent_chunk_start}:{latent_chunk_end})"
+                    )
+                else:
+                    # No latents for this chunk, remove the parameter
+                    chunk_kwargs.pop("latents", None)
+                    print(f"  No latents available for chunk {chunk_idx+1}")
+            else:
+                # No initialization latents provided
+                if chunk_idx > 0:
+                    # For extension chunks, we can optionally provide initialization latents
+                    # This is particularly useful when we want to initialize the new chunk
+                    # with some prior knowledge or when extending from previous results
+
+                    # Create empty latents for the new chunk if no other initialization is provided
+                    latent_height = height // self.vae_scale_factor
+                    latent_width = width // self.vae_scale_factor
+                    latent_num_frames = chunk_num_frames // self.video_scale_factor
+                    if isinstance(self.vae, CausalVideoAutoencoder) and is_video:
+                        latent_num_frames += 1
+
+                    batch_size = (
+                        kwargs.get("prompt_embeds", torch.ones(1, 1, 1)).shape[0]
+                        if kwargs.get("prompt_embeds") is not None
+                        else 1
+                    )
+                    num_images_per_prompt = kwargs.get("num_images_per_prompt", 1)
+
+                    init_latent_shape = (
+                        batch_size * num_images_per_prompt,
+                        self.transformer.config.in_channels,
+                        latent_num_frames,
+                        latent_height,
+                        latent_width,
+                    )
+
+                    # Prepare initialization latents for this chunk
+                    chunk_init_latents = self.prepare_latents(
+                        latents=None,  # No existing latents for extension chunks
+                        media_items=None,  # No media items for extension chunks
+                        timestep=1.0,  # Full noise for new content
+                        latent_shape=init_latent_shape,
+                        dtype=torch.float32,
+                        device=device,
+                        generator=chunk_kwargs.get("generator"),
+                        vae_per_channel_normalize=kwargs.get(
+                            "vae_per_channel_normalize", True
+                        ),
+                    )
+
+                    # Store initialization latents for potential use in conditioning
+                    chunk_kwargs["_chunk_init_latents"] = chunk_init_latents
 
             # Run complete denoising process for this chunk
             result = self.__call__(
@@ -2571,6 +2673,44 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             return ImagePipelineOutput(images=final_output)
         else:
             return (final_output,)
+
+    @staticmethod
+    def tone_map_latents(
+        latents: torch.Tensor,
+        compression: float,
+    ) -> torch.Tensor:
+        """
+        Applies a non-linear tone-mapping function to latent values to reduce their dynamic range
+        in a perceptually smooth way using a sigmoid-based compression.
+        This is useful for regularizing high-variance latents or for conditioning outputs
+        during generation, especially when controlling dynamic behavior with a `compression` factor.
+        Parameters:
+        ----------
+        latents : torch.Tensor
+            Input latent tensor with arbitrary shape. Expected to be roughly in [-1, 1] or [0, 1] range.
+        compression : float
+            Compression strength in the range [0, 1].
+            - 0.0: No tone-mapping (identity transform)
+            - 1.0: Full compression effect
+        Returns:
+        -------
+        torch.Tensor
+            The tone-mapped latent tensor of the same shape as input.
+        """
+        if not (0 <= compression <= 1):
+            raise ValueError("Compression must be in the range [0, 1]")
+
+        # Remap [0-1] to [0-0.75] and apply sigmoid compression in one shot
+        scale_factor = compression * 0.75
+        abs_latents = torch.abs(latents)
+
+        # Sigmoid compression: sigmoid shifts large values toward 0.2, small values stay ~1.0
+        # When scale_factor=0, sigmoid term vanishes, when scale_factor=0.75, full effect
+        sigmoid_term = torch.sigmoid(4.0 * scale_factor * (abs_latents - 1.0))
+        scales = 1.0 - 0.8 * scale_factor * sigmoid_term
+
+        filtered = latents * scales
+        return filtered
 
 
 def adain_filter_latent(
