@@ -2399,10 +2399,14 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         conditioning_strength=temporal_overlap_strength,
                     )
                     chunk_conditioning_items.append(overlap_item)
-                    logger.debug(f"  Added overlap conditioning: {overlap_pixels.shape}")
+                    logger.debug(
+                        f"  Added overlap conditioning: {overlap_pixels.shape}"
+                    )
 
                 except Exception as e:
-                    logger.debug(f"  Warning: Failed to create overlap conditioning: {e}")
+                    logger.debug(
+                        f"  Warning: Failed to create overlap conditioning: {e}"
+                    )
 
             # Add guiding latents for this chunk if specified
             if use_guiding_latents and kwargs.get("conditioning_items"):
@@ -2516,49 +2520,83 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 chunk_conditioning_items if chunk_conditioning_items else None
             )
 
-            if chunk_idx > 0:
-                # For extension chunks, we can optionally provide initialization latents
-                # This is particularly useful when we want to initialize the new chunk
-                # with some prior knowledge or when extending from previous results
+            # Handle initialization latents for this chunk
+            if kwargs.get("latents") is not None:
+                # If we have initialization latents, slice them for this chunk
+                full_latents = kwargs["latents"]
 
-                # Create empty latents for the new chunk if no other initialization is provided
+                # Calculate latent space dimensions for this chunk
                 latent_height = height // self.vae_scale_factor
                 latent_width = width // self.vae_scale_factor
-                latent_num_frames = chunk_num_frames // self.video_scale_factor
+                latent_chunk_start = start_frame // self.video_scale_factor
+                latent_chunk_frames = chunk_num_frames // self.video_scale_factor
                 if isinstance(self.vae, CausalVideoAutoencoder) and is_video:
-                    latent_num_frames += 1
+                    latent_chunk_frames += 1
 
-                batch_size = (
-                    kwargs.get("prompt_embeds", torch.ones(1, 1, 1)).shape[0]
-                    if kwargs.get("prompt_embeds") is not None
-                    else 1
-                )
-                num_images_per_prompt = kwargs.get("num_images_per_prompt", 1)
+                latent_chunk_end = latent_chunk_start + latent_chunk_frames
 
-                init_latent_shape = (
-                    batch_size * num_images_per_prompt,
-                    self.transformer.config.in_channels,
-                    latent_num_frames,
-                    latent_height,
-                    latent_width,
-                )
+                # Ensure we don't exceed the bounds of the full latents
+                latent_chunk_end = min(latent_chunk_end, full_latents.shape[2])
+                actual_latent_frames = latent_chunk_end - latent_chunk_start
 
-                # Prepare initialization latents for this chunk
-                chunk_init_latents = self.prepare_latents(
-                    latents=None,  # No existing latents for extension chunks
-                    media_items=None,  # No media items for extension chunks
-                    timestep=1.0,  # Full noise for new content
-                    latent_shape=init_latent_shape,
-                    dtype=torch.float32,
-                    device=device,
-                    generator=chunk_kwargs.get("generator"),
-                    vae_per_channel_normalize=kwargs.get(
-                        "vae_per_channel_normalize", True
-                    ),
-                )
+                if actual_latent_frames > 0:
+                    # Slice the latents for this chunk
+                    chunk_latents = full_latents[
+                        :, :, latent_chunk_start:latent_chunk_end
+                    ]
+                    chunk_kwargs["latents"] = chunk_latents
+                    logger.debug(
+                        f"  Using sliced latents: {chunk_latents.shape} (from {latent_chunk_start}:{latent_chunk_end})"
+                    )
+                else:
+                    # No latents for this chunk, remove the parameter
+                    chunk_kwargs.pop("latents", None)
+                    logger.debug(f"  No latents available for chunk {chunk_idx+1}")
+            else:
+                # No initialization latents provided
+                if chunk_idx > 0:
+                    # For extension chunks, we can optionally provide initialization latents
+                    # This is particularly useful when we want to initialize the new chunk
+                    # with some prior knowledge or when extending from previous results
 
-                # Store initialization latents for potential use in conditioning
-                chunk_kwargs["_chunk_init_latents"] = chunk_init_latents
+                    # Create empty latents for the new chunk if no other initialization is provided
+                    latent_height = height // self.vae_scale_factor
+                    latent_width = width // self.vae_scale_factor
+                    latent_num_frames = chunk_num_frames // self.video_scale_factor
+                    if isinstance(self.vae, CausalVideoAutoencoder) and is_video:
+                        latent_num_frames += 1
+
+                    batch_size = (
+                        kwargs.get("prompt_embeds", torch.ones(1, 1, 1)).shape[0]
+                        if kwargs.get("prompt_embeds") is not None
+                        else 1
+                    )
+                    num_images_per_prompt = kwargs.get("num_images_per_prompt", 1)
+
+                    init_latent_shape = (
+                        batch_size * num_images_per_prompt,
+                        self.transformer.config.in_channels,
+                        latent_num_frames,
+                        latent_height,
+                        latent_width,
+                    )
+
+                    # Prepare initialization latents for this chunk
+                    chunk_init_latents = self.prepare_latents(
+                        latents=None,  # No existing latents for extension chunks
+                        media_items=None,  # No media items for extension chunks
+                        timestep=1.0,  # Full noise for new content
+                        latent_shape=init_latent_shape,
+                        dtype=torch.float32,
+                        device=device,
+                        generator=chunk_kwargs.get("generator"),
+                        vae_per_channel_normalize=kwargs.get(
+                            "vae_per_channel_normalize", True
+                        ),
+                    )
+
+                    # Store initialization latents for potential use in conditioning
+                    chunk_kwargs["_chunk_init_latents"] = chunk_init_latents
 
             # Run complete denoising process for this chunk
             result = self.__call__(
