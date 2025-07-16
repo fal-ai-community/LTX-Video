@@ -4,6 +4,7 @@ from diffusers import AutoencoderKL
 from einops import rearrange, repeat
 from torch import Tensor
 from math import ceil
+from tqdm import tqdm
 
 
 from ltx_video.models.autoencoders.causal_video_autoencoder import (
@@ -372,7 +373,7 @@ def tiled_decode(
             values = torch.zeros((batch_size, 3, out_t, out_h, out_w), dtype=dtype, device=device)
             
             # Process each tile
-            for h, h_, w, w_ in tasks:
+            for h, h_, w, w_ in tqdm(tasks, desc="Decoding", total=len(tasks), unit="tile"):
                 # Extract tile
                 tile_latent = latents[:, :, :, h:h_, w:w_]
                 
