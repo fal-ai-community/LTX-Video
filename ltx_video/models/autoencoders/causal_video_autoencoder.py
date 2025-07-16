@@ -518,10 +518,19 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                     "Custom kernels not available, falling back to PyTorch implementation"
                 )
 
-        # PyTorch fallback implementation
-        # Apply pixel normalization: x = (x * scale) + shift
+        # PyTorch fallback implementation for pixel normalization with adaptive scale/shift
+        # Based on PixelNorm class: x / sqrt(mean(x^2) + eps) followed by adaptive scaling
+
+        # Pixel normalization (RMS normalization over channel dimension)
+        # x shape is typically (B, C, F, H, W)
+        x_normalized = x / torch.sqrt(torch.mean(x**2, dim=1, keepdim=True) + eps)
+
+        # Apply adaptive scale and shift (AdaLN style)
         if scale is not None and shift is not None:
-            x.mul_(1 + scale).add_(shift)
+            x_normalized = x_normalized * (1 + scale) + shift
+
+        # Copy back to original tensor
+        x.copy_(x_normalized)
         return x
 
     def _add_inplace(self, x, workspace, offset):
@@ -540,9 +549,12 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 )
 
         # PyTorch fallback implementation
-        # Add workspace to x with offset: x += workspace[:, :, offset:-offset or None, :, :]
+        # Add processed workspace content back to hidden_states
+        # workspace has temporal padding, so we need to account for offset
         if offset > 0:
-            x.add_(workspace[:, :, offset:-offset, :, :])
+            # workspace shape: (B, C, F+2, H, W), x shape: (B, C, F, H, W)
+            # Add the middle part of workspace (excluding padding) to x
+            x.add_(workspace[:, :, offset : offset + x.shape[2], :, :])
         else:
             x.add_(workspace)
         return x
