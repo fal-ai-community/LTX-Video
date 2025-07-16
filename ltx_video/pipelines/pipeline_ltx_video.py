@@ -1646,7 +1646,44 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 )
 
                 if is_already_encoded:
-                    # Media item is already in latent space, use directly
+                    # Media item is already in latent space, but we need to resize it to match target dimensions
+                    # Calculate target latent dimensions
+                    target_latent_height = (
+                        height // self.video_pipeline.vae_scale_factor
+                        if hasattr(self, "video_pipeline")
+                        else height // self.vae_scale_factor
+                    )
+                    target_latent_width = (
+                        width // self.video_pipeline.vae_scale_factor
+                        if hasattr(self, "video_pipeline")
+                        else width // self.vae_scale_factor
+                    )
+
+                    current_latent_height, current_latent_width = media_item.shape[-2:]
+
+                    if (
+                        current_latent_height != target_latent_height
+                        or current_latent_width != target_latent_width
+                    ):
+                        # Resize pre-encoded latents to match target latent dimensions
+                        b, c, f, h, w = media_item.shape
+                        # Reshape to (b*f, c, h, w) for interpolation
+                        media_item_reshaped = media_item.permute(0, 2, 1, 3, 4).reshape(
+                            b * f, c, h, w
+                        )
+                        # Resize using bilinear interpolation
+                        media_item_resized = F.interpolate(
+                            media_item_reshaped,
+                            size=(target_latent_height, target_latent_width),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+
+                        # Reshape back to (b, c, f, h, w)
+                        media_item = media_item_resized.reshape(
+                            b, f, c, target_latent_height, target_latent_width
+                        ).permute(0, 2, 1, 3, 4)
+
                     media_item_latents = media_item.to(dtype=init_latents.dtype)
                     logger.debug(
                         f"Using pre-encoded guiding latents: {media_item.shape}, frame_number={media_frame_number}"
@@ -2796,8 +2833,6 @@ class LTXMultiScalePipeline:
         original_width = kwargs["width"]
         original_height = kwargs["height"]
 
-        conditioning_items = kwargs.pop("conditioning_items", None)
-
         x_width = int(kwargs["width"] * downscale_factor)
         downscaled_width = x_width - (x_width % self.video_pipeline.vae_scale_factor)
         x_height = int(kwargs["height"] * downscale_factor)
@@ -2808,12 +2843,6 @@ class LTXMultiScalePipeline:
         kwargs["height"] = downscaled_height
 
         kwargs.update(**first_pass)
-
-        if conditioning_items is not None:
-            kwargs["conditioning_items"] = [
-                conditioning_item.deep_copy()
-                for conditioning_item in conditioning_items
-            ]
 
         result = self.video_pipeline(*args, **kwargs)
         latents = result.images
@@ -2830,10 +2859,6 @@ class LTXMultiScalePipeline:
         kwargs["width"] = downscaled_width * 2
         kwargs["height"] = downscaled_height * 2
         kwargs.update(**second_pass)
-
-        if conditioning_items is not None:
-            # Feel free to modify the conditioning items for the second pass
-            kwargs["conditioning_items"] = conditioning_items
 
         result = self.video_pipeline(*args, **kwargs)
         if original_output_type != "latent":
