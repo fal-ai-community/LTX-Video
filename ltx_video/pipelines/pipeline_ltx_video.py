@@ -281,6 +281,19 @@ class ConditioningItem:
     media_x: Optional[int] = None
     media_y: Optional[int] = None
 
+    def deep_copy(self) -> "ConditioningItem":
+        """
+        Create a deep copy of the ConditioningItem instance.
+        """
+        return ConditioningItem(
+            media_item=self.media_item.clone(),
+            conditioning_type=self.conditioning_type,
+            media_frame_number=self.media_frame_number,
+            conditioning_strength=self.conditioning_strength,
+            media_x=self.media_x,
+            media_y=self.media_y,
+        )
+
 
 class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
     r"""
@@ -2783,6 +2796,8 @@ class LTXMultiScalePipeline:
         original_width = kwargs["width"]
         original_height = kwargs["height"]
 
+        conditioning_items = kwargs.pop("conditioning_items", None)
+
         x_width = int(kwargs["width"] * downscale_factor)
         downscaled_width = x_width - (x_width % self.video_pipeline.vae_scale_factor)
         x_height = int(kwargs["height"] * downscale_factor)
@@ -2791,7 +2806,14 @@ class LTXMultiScalePipeline:
         kwargs["output_type"] = "latent"
         kwargs["width"] = downscaled_width
         kwargs["height"] = downscaled_height
+
         kwargs.update(**first_pass)
+
+        if conditioning_items is not None:
+            kwargs["conditioning_items"] = [
+                conditioning_item.deep_copy()
+                for conditioning_item in conditioning_items
+            ]
 
         result = self.video_pipeline(*args, **kwargs)
         latents = result.images
@@ -2808,6 +2830,10 @@ class LTXMultiScalePipeline:
         kwargs["width"] = downscaled_width * 2
         kwargs["height"] = downscaled_height * 2
         kwargs.update(**second_pass)
+
+        if conditioning_items is not None:
+            # Feel free to modify the conditioning items for the second pass
+            kwargs["conditioning_items"] = conditioning_items
 
         result = self.video_pipeline(*args, **kwargs)
         if original_output_type != "latent":
