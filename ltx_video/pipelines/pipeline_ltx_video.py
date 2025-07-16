@@ -831,6 +831,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         text_encoder_max_tokens: int = 256,
         stochastic_sampling: bool = False,
         media_items: Optional[torch.Tensor] = None,
+        decode_tiling: bool = False,
+        decode_tile_size: Tuple[int, int] = (64, 64),
+        decode_tile_stride: Tuple[int, int] = (32, 32),
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         """
@@ -1366,12 +1369,16 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 )
             else:
                 decode_timestep = None
+
             image = vae_decode(
                 latents,
                 self.vae,
                 is_video,
                 vae_per_channel_normalize=kwargs["vae_per_channel_normalize"],
                 timestep=decode_timestep,
+                use_tiling=decode_tiling,
+                tile_size=decode_tile_size,
+                tile_stride=decode_tile_stride,
             )
 
             image = self.image_processor.postprocess(image, output_type=output_type)
