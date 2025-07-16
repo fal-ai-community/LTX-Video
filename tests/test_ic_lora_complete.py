@@ -126,7 +126,7 @@ def run_ic_lora_generation(args):
     logger.info(f"Using device: {device}")
 
     logger.info(f"Loading LTX-Video pipeline from: {args.model_path}")
-    text_encoder_path = args.text_encoder_path or "PixArt-alpha/PixArt-XL-2-1024-MS"
+    text_encoder_path = args.text_encoder_path or "PixArt-alpha/PixArt-XL-2-1024-MS",
 
     pipeline = create_ltx_video_pipeline(
         ckpt_path=args.model_path,
@@ -176,6 +176,7 @@ def run_ic_lora_generation(args):
             conditioning_type="guiding_latents",
             media_frame_number=args.depth_start_frame,
             conditioning_strength=args.depth_strength,
+            lora_name="depth",
         )
         conditioning_items.append(depth_conditioning)
 
@@ -203,6 +204,7 @@ def run_ic_lora_generation(args):
             conditioning_type="guiding_latents",
             media_frame_number=args.pose_start_frame,
             conditioning_strength=args.pose_strength,
+            lora_name="pose",
         )
         conditioning_items.append(pose_conditioning)
 
