@@ -519,7 +519,7 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                 )
 
         # PyTorch fallback implementation for pixel normalization with adaptive scale/shift
-        # Based on PixelNorm class: x / sqrt(mean(x^2) + eps) followed by adaptive scaling
+        # Based on CUDA kernel: RMS normalization + AdaLN + SiLU activation
 
         # Pixel normalization (RMS normalization over channel dimension)
         # x shape is typically (B, C, F, H, W)
@@ -528,6 +528,9 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         # Apply adaptive scale and shift (AdaLN style)
         if scale is not None and shift is not None:
             x_normalized = x_normalized * (1 + scale) + shift
+
+        # Apply SiLU activation (critical step that was missing!)
+        x_normalized = F.silu(x_normalized)
 
         # Copy back to original tensor
         x.copy_(x_normalized)
