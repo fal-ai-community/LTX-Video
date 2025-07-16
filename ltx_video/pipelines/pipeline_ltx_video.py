@@ -1050,6 +1050,8 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 num_inference_steps=num_inference_steps,
+                skip_initial_inference_steps=skip_initial_inference_steps,
+                skip_final_inference_steps=skip_final_inference_steps,
                 timesteps=timesteps,
                 guidance_scale=guidance_scale,
                 cfg_star_rescale=cfg_star_rescale,
