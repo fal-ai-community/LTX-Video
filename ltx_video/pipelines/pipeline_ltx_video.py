@@ -791,6 +791,191 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             media_items = rearrange(media_items, "(b n) c h w -> b c n h w", n=n_frames)
         return media_items
 
+    def get_noise_pred_for_step(
+        self,
+        i: int,
+        t: float,
+        latents: torch.Tensor,
+        init_latents: torch.Tensor,
+        pixel_coords: torch.Tensor,
+        prompt_embeds_batch: torch.Tensor,
+        prompt_attention_mask_batch: torch.Tensor,
+        batch_size: int,
+        is_video: bool,
+        frame_rate: float,
+        generator: Union[torch.Generator, List[torch.Generator]],
+        mixed_precision: bool = False,
+        skip_layer_strategy: Optional[str] = None,
+        skip_block_list: Optional[List[List[int]]] = None,
+        guidance_scale: torch.Tensor = None,
+        stg_scale: torch.Tensor = None,
+        rescaling_scale: torch.Tensor = None,
+        orig_conditioning_mask: Optional[torch.Tensor] = None,
+        image_cond_noise_scale: float = 0.0,
+        cfg_star_rescale: bool = False,
+        num_images_per_prompt: int = 1,
+    ) -> torch.Tensor:
+        """
+        Predicts the noise for a given timestep using the transformer model.
+        """
+        do_classifier_free_guidance = guidance_scale[i] > 1.0
+        do_spatio_temporal_guidance = stg_scale[i] > 0
+        do_rescaling = rescaling_scale[i] != 1.0
+
+        num_conds = 1
+        if do_classifier_free_guidance:
+            num_conds += 1
+        if do_spatio_temporal_guidance:
+            num_conds += 1
+
+        if do_classifier_free_guidance and do_spatio_temporal_guidance:
+            indices = slice(batch_size * 0, batch_size * 3)
+        elif do_classifier_free_guidance:
+            indices = slice(batch_size * 0, batch_size * 2)
+        elif do_spatio_temporal_guidance:
+            indices = slice(batch_size * 1, batch_size * 3)
+        else:
+            indices = slice(batch_size * 1, batch_size * 2)
+
+        # Prepare skip layer masks
+        skip_layer_mask: Optional[torch.Tensor] = None
+        if do_spatio_temporal_guidance:
+            if skip_block_list is not None:
+                skip_layer_mask = self.transformer.create_skip_layer_mask(
+                    batch_size, num_conds, num_conds - 1, skip_block_list[i]
+                )
+
+        batch_pixel_coords = torch.cat([pixel_coords] * num_conds)
+        conditioning_mask = orig_conditioning_mask
+        if conditioning_mask is not None and is_video:
+            assert num_images_per_prompt == 1
+            conditioning_mask = torch.cat([conditioning_mask] * num_conds)
+        fractional_coords = batch_pixel_coords.to(torch.float32)
+        fractional_coords[:, 0] = fractional_coords[:, 0] * (1.0 / frame_rate)
+
+        if conditioning_mask is not None and image_cond_noise_scale > 0.0:
+            latents = self.add_noise_to_image_conditioning_latents(
+                t,
+                init_latents,
+                latents,
+                image_cond_noise_scale,
+                orig_conditioning_mask,
+                generator,
+            )
+
+        latent_model_input = (
+            torch.cat([latents] * num_conds) if num_conds > 1 else latents
+        )
+        latent_model_input = self.scheduler.scale_model_input(
+            latent_model_input, t
+        )
+
+        current_timestep = t
+        if not torch.is_tensor(current_timestep):
+            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+            # This would be a good case for the `match` statement (Python 3.10+)
+            is_mps = latent_model_input.device.type == "mps"
+            if isinstance(current_timestep, float):
+                dtype = torch.float32 if is_mps else torch.float64
+            else:
+                dtype = torch.int32 if is_mps else torch.int64
+            current_timestep = torch.tensor(
+                [current_timestep],
+                dtype=dtype,
+                device=latent_model_input.device,
+            )
+        elif len(current_timestep.shape) == 0:
+            current_timestep = current_timestep[None].to(
+                latent_model_input.device
+            )
+        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        current_timestep = current_timestep.expand(
+            latent_model_input.shape[0]
+        ).unsqueeze(-1)
+
+        if conditioning_mask is not None:
+            # Conditioning latents have an initial timestep and noising level of (1.0 - conditioning_mask)
+            # and will start to be denoised when the current timestep is lower than their conditioning timestep.
+            current_timestep = torch.min(
+                current_timestep, 1.0 - conditioning_mask
+            )
+
+        # Choose the appropriate context manager based on `mixed_precision`
+        if mixed_precision:
+            context_manager = torch.autocast(device.type, dtype=torch.bfloat16)
+        else:
+            context_manager = nullcontext()  # Dummy context manager
+
+        # predict noise model_output
+        with context_manager:
+            noise_pred = self.transformer(
+                latent_model_input.to(self.transformer.dtype),
+                indices_grid=fractional_coords,
+                encoder_hidden_states=prompt_embeds_batch[indices].to(
+                    self.transformer.dtype
+                ),
+                encoder_attention_mask=prompt_attention_mask_batch[indices],
+                timestep=current_timestep,
+                skip_layer_mask=skip_layer_mask,
+                skip_layer_strategy=skip_layer_strategy,
+                return_dict=False,
+            )[0]
+
+        # perform guidance
+        if do_spatio_temporal_guidance:
+            noise_pred_text, noise_pred_text_perturb = noise_pred.chunk(
+                num_conds
+            )[-2:]
+        if do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(num_conds)[:2]
+
+            if cfg_star_rescale:
+                # Rescales the unconditional noise prediction using the projection of the conditional prediction onto it:
+                # α = (⟨ε_text, ε_uncond⟩ / ||ε_uncond||²), then ε_uncond ← α * ε_uncond
+                # where ε_text is the conditional noise prediction and ε_uncond is the unconditional one.
+                positive_flat = noise_pred_text.view(batch_size, -1)
+                negative_flat = noise_pred_uncond.view(batch_size, -1)
+                dot_product = torch.sum(
+                    positive_flat * negative_flat, dim=1, keepdim=True
+                )
+                squared_norm = (
+                    torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
+                )
+                alpha = dot_product / squared_norm
+                noise_pred_uncond = alpha * noise_pred_uncond
+
+            noise_pred = noise_pred_uncond + guidance_scale[i] * (
+                noise_pred_text - noise_pred_uncond
+            )
+        elif do_spatio_temporal_guidance:
+            noise_pred = noise_pred_text
+        if do_spatio_temporal_guidance:
+            noise_pred = noise_pred + stg_scale[i] * (
+                noise_pred_text - noise_pred_text_perturb
+            )
+            if do_rescaling and stg_scale[i] > 0.0:
+                noise_pred_text_std = noise_pred_text.view(batch_size, -1).std(
+                    dim=1, keepdim=True
+                )
+                noise_pred_std = noise_pred.view(batch_size, -1).std(
+                    dim=1, keepdim=True
+                )
+
+                factor = noise_pred_text_std / noise_pred_std
+                factor = rescaling_scale[i] * factor + (1 - rescaling_scale[i])
+
+                noise_pred = noise_pred * factor.view(batch_size, 1, 1)
+
+        current_timestep = current_timestep[:1]
+        # learned sigma
+        if (
+            self.transformer.config.out_channels // 2
+            == self.transformer.config.in_channels
+        ):
+            noise_pred = noise_pred.chunk(2, dim=1)[0]
+
+        return noise_pred
+
     @torch.no_grad()
     def __call__(
         self,
@@ -1156,167 +1341,34 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                do_classifier_free_guidance = guidance_scale[i] > 1.0
-                do_spatio_temporal_guidance = stg_scale[i] > 0
-                do_rescaling = rescaling_scale[i] != 1.0
-
-                num_conds = 1
-                if do_classifier_free_guidance:
-                    num_conds += 1
-                if do_spatio_temporal_guidance:
-                    num_conds += 1
-
-                if do_classifier_free_guidance and do_spatio_temporal_guidance:
-                    indices = slice(batch_size * 0, batch_size * 3)
-                elif do_classifier_free_guidance:
-                    indices = slice(batch_size * 0, batch_size * 2)
-                elif do_spatio_temporal_guidance:
-                    indices = slice(batch_size * 1, batch_size * 3)
-                else:
-                    indices = slice(batch_size * 1, batch_size * 2)
-
-                # Prepare skip layer masks
-                skip_layer_mask: Optional[torch.Tensor] = None
-                if do_spatio_temporal_guidance:
-                    if skip_block_list is not None:
-                        skip_layer_mask = self.transformer.create_skip_layer_mask(
-                            batch_size, num_conds, num_conds - 1, skip_block_list[i]
-                        )
-
-                batch_pixel_coords = torch.cat([pixel_coords] * num_conds)
-                conditioning_mask = orig_conditioning_mask
-                if conditioning_mask is not None and is_video:
-                    assert num_images_per_prompt == 1
-                    conditioning_mask = torch.cat([conditioning_mask] * num_conds)
-                fractional_coords = batch_pixel_coords.to(torch.float32)
-                fractional_coords[:, 0] = fractional_coords[:, 0] * (1.0 / frame_rate)
-
-                if conditioning_mask is not None and image_cond_noise_scale > 0.0:
-                    latents = self.add_noise_to_image_conditioning_latents(
-                        t,
-                        init_latents,
-                        latents,
-                        image_cond_noise_scale,
-                        orig_conditioning_mask,
-                        generator,
-                    )
-
-                latent_model_input = (
-                    torch.cat([latents] * num_conds) if num_conds > 1 else latents
+                noise_pred = self.get_noise_pred_for_step(
+                    i,
+                    t,
+                    latents,
+                    init_latents,
+                    pixel_coords,
+                    prompt_embeds_batch,
+                    prompt_attention_mask_batch,
+                    batch_size,
+                    is_video,
+                    frame_rate,
+                    generator=generator,
+                    mixed_precision=mixed_precision,
+                    skip_layer_strategy=skip_layer_strategy,
+                    skip_block_list=skip_block_list,
+                    guidance_scale=guidance_scale,
+                    stg_scale=stg_scale,
+                    rescaling_scale=rescaling_scale,
+                    orig_conditioning_mask=orig_conditioning_mask,
+                    image_cond_noise_scale=image_cond_noise_scale,
+                    cfg_star_rescale=cfg_star_rescale,
+                    num_images_per_prompt=num_images_per_prompt,
                 )
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
-
-                current_timestep = t
-                if not torch.is_tensor(current_timestep):
-                    # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                    # This would be a good case for the `match` statement (Python 3.10+)
-                    is_mps = latent_model_input.device.type == "mps"
-                    if isinstance(current_timestep, float):
-                        dtype = torch.float32 if is_mps else torch.float64
-                    else:
-                        dtype = torch.int32 if is_mps else torch.int64
-                    current_timestep = torch.tensor(
-                        [current_timestep],
-                        dtype=dtype,
-                        device=latent_model_input.device,
-                    )
-                elif len(current_timestep.shape) == 0:
-                    current_timestep = current_timestep[None].to(
-                        latent_model_input.device
-                    )
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                current_timestep = current_timestep.expand(
-                    latent_model_input.shape[0]
-                ).unsqueeze(-1)
-
-                if conditioning_mask is not None:
-                    # Conditioning latents have an initial timestep and noising level of (1.0 - conditioning_mask)
-                    # and will start to be denoised when the current timestep is lower than their conditioning timestep.
-                    current_timestep = torch.min(
-                        current_timestep, 1.0 - conditioning_mask
-                    )
-
-                # Choose the appropriate context manager based on `mixed_precision`
-                if mixed_precision:
-                    context_manager = torch.autocast(device.type, dtype=torch.bfloat16)
-                else:
-                    context_manager = nullcontext()  # Dummy context manager
-
-                # predict noise model_output
-                with context_manager:
-                    noise_pred = self.transformer(
-                        latent_model_input.to(self.transformer.dtype),
-                        indices_grid=fractional_coords,
-                        encoder_hidden_states=prompt_embeds_batch[indices].to(
-                            self.transformer.dtype
-                        ),
-                        encoder_attention_mask=prompt_attention_mask_batch[indices],
-                        timestep=current_timestep,
-                        skip_layer_mask=skip_layer_mask,
-                        skip_layer_strategy=skip_layer_strategy,
-                        return_dict=False,
-                    )[0]
-
-                # perform guidance
-                if do_spatio_temporal_guidance:
-                    noise_pred_text, noise_pred_text_perturb = noise_pred.chunk(
-                        num_conds
-                    )[-2:]
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(num_conds)[:2]
-
-                    if cfg_star_rescale:
-                        # Rescales the unconditional noise prediction using the projection of the conditional prediction onto it:
-                        # α = (⟨ε_text, ε_uncond⟩ / ||ε_uncond||²), then ε_uncond ← α * ε_uncond
-                        # where ε_text is the conditional noise prediction and ε_uncond is the unconditional one.
-                        positive_flat = noise_pred_text.view(batch_size, -1)
-                        negative_flat = noise_pred_uncond.view(batch_size, -1)
-                        dot_product = torch.sum(
-                            positive_flat * negative_flat, dim=1, keepdim=True
-                        )
-                        squared_norm = (
-                            torch.sum(negative_flat**2, dim=1, keepdim=True) + 1e-8
-                        )
-                        alpha = dot_product / squared_norm
-                        noise_pred_uncond = alpha * noise_pred_uncond
-
-                    noise_pred = noise_pred_uncond + guidance_scale[i] * (
-                        noise_pred_text - noise_pred_uncond
-                    )
-                elif do_spatio_temporal_guidance:
-                    noise_pred = noise_pred_text
-                if do_spatio_temporal_guidance:
-                    noise_pred = noise_pred + stg_scale[i] * (
-                        noise_pred_text - noise_pred_text_perturb
-                    )
-                    if do_rescaling and stg_scale[i] > 0.0:
-                        noise_pred_text_std = noise_pred_text.view(batch_size, -1).std(
-                            dim=1, keepdim=True
-                        )
-                        noise_pred_std = noise_pred.view(batch_size, -1).std(
-                            dim=1, keepdim=True
-                        )
-
-                        factor = noise_pred_text_std / noise_pred_std
-                        factor = rescaling_scale[i] * factor + (1 - rescaling_scale[i])
-
-                        noise_pred = noise_pred * factor.view(batch_size, 1, 1)
-
-                current_timestep = current_timestep[:1]
-                # learned sigma
-                if (
-                    self.transformer.config.out_channels // 2
-                    == self.transformer.config.in_channels
-                ):
-                    noise_pred = noise_pred.chunk(2, dim=1)[0]
-
                 # compute previous image: x_t -> x_t-1
                 latents = self.denoising_step(
                     latents,
                     noise_pred,
-                    current_timestep,
+                    torch.tensor([t], device=latents.device),
                     orig_conditioning_mask,
                     t,
                     extra_step_kwargs,
