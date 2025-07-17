@@ -259,6 +259,8 @@ def run_temporal_tiling_ic_lora_test(args):
             chunk_frames = (end - start - 1) * video_scale_factor + 1
             logger.info(f"      Chunk {i+1}: latent {start}-{end} ({chunk_frames} pixel frames)")
 
+# {'device': 'cuda', 'generator': <torch._C.Generator object at 0x7f9f71c644b0>, 'callback_on_step_end': None, 'output_type': 'pt', 'num_images_per_prompt': 1, 'is_video': True, 'mixed_precision': True, 'offload_to_cpu': False, 'enhance_prompt': False, 'vae_per_channel_normalize': True, 'temporal_tile_size': 80, 'temporal_overlap': 24, 'use_guiding_latents': True, 'temporal_adain_factor': 0.0, 'temporal_overlap_strength': 0.5, 'guiding_strength': 1.0, 'decode_tiling': True, 'decode_tile_size': (16, 16), 'decode_tile_stride': (14, 14), 'height': 704, 'width': 1280, 'num_frames': 193, 'frame_rate': 25, 'prompt': "A cinematic fast-tracking shot follows a vintage, teal camper van as it descends a winding mountain trail. The van, slightly weathered but well-maintained, is the central focus, its retro design emphasized by the motion blur. Medium shot reveals the dusty, ochre trail, edged with vibrant green pine trees. Close-up on the van's tires shows the gravel spraying, highlighting the speed and rugged terrain. Sunlight filters through the trees, casting dappled shadows on the van and the trail. The background is a hazy, majestic mountain range bathed in warm, golden light. The overall mood is adventurous and exhilarating. High resolution 4k movie scene.", 'negative_prompt': 'worst quality, inconsistent motion, blurry, jittery, distorted', 'skip_layer_strategy': <SkipLayerStrategy.AttentionValues: 2>, 'conditioning_items': None, 'stochastic_sampling': False, 'decode_timestep': 0.05, 'decode_noise_scale': 0.025, 'downscale_factor': 0.6666666, 'first_pass': {'guidance_timesteps': [1.0, 0.9937, 0.9875, 0.9812, 0.975, 0.9094, 0.725], 'guidance_scale': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 'stg_scale': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 'rescaling_scale': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 'skip_block_list': [[42], [42], [42], [42], [42], [42], [42]], 'num_inference_steps': 8, 'skip_initial_inference_steps': 0, 'skip_final_inference_steps': 1, 'cfg_star_rescale': False}, 'second_pass': {'guidance_timesteps': [0.9094, 0.725, 0.4219], 'guidance_scale': [1.0, 1.0, 1.0], 'stg_scale': [0.0, 0.0, 0.0], 'rescaling_scale': [1.0, 1.0, 1.0], 'skip_block_list': [[42], [42], [42]], 'num_inference_steps': 8, 'skip_initial_inference_steps': 4, 'skip_final_inference_steps': 0, 'cfg_star_rescale': False, 'tone_map_compression_ratio': 0.6}}##
+
     # Generation parameters
     generation_params = {
         "height": args.height,
@@ -266,9 +268,8 @@ def run_temporal_tiling_ic_lora_test(args):
         "num_frames": args.num_frames,
         "frame_rate": args.frame_rate,
         "prompt": args.prompt,
+        "negative_prompt": 'worst quality, inconsistent motion, blurry, jittery, distorted',
         "conditioning_items": conditioning_items,
-        "num_inference_steps": args.num_inference_steps,
-        "guidance_scale": args.guidance_scale,
         "is_video": True,
         "vae_per_channel_normalize": True,
         "output_type": "latent",  # Get tensors directly
@@ -279,13 +280,33 @@ def run_temporal_tiling_ic_lora_test(args):
         "use_guiding_latents": args.use_guiding_latents,
         "guiding_strength": args.guiding_strength,
         "temporal_adain_factor": args.temporal_adain_factor,
-        "tone_map_compression_ratio": 0.5,
+        "decode_timestep": 0.05,
+        "decode_noise_scale": 0.25,
+        "guidance_scale": 1.0,
+        "num_inference_steps": args.num_inference_steps,
+        "stg_scale": 0.0,
     }
 
     if args.upsampler_model_path:
         generation_params["downscale_factor"] = 0.66667
-        generation_params["first_pass"] = {"skip_final_inference_steps": int(2 * args.num_inference_steps // 5)}
-        generation_params["second_pass"] = {"skip_initial_inference_steps": int(3 * args.num_inference_steps // 5)}
+        generation_params["first_pass"] = {
+            #"skip_final_inference_steps": 1,
+            #"guidance_timesteps": [1.0, 0.9937, 0.9875, 0.9812, 0.975, 0.9094, 0.725],
+            #"num_inference_steps": 8,
+            #"guidance_scale": [1.0] * 7,
+            #"stg_scale": [0.0] * 7,
+            #"rescaling_scale": [1.0] * 7,
+            #"skip_block_list": [[42] for i in range(7)],
+        }
+        generation_params["second_pass"] = {
+            #"skip_initial_inference_steps": 5,
+            #"guidance_timesteps": [0.9094, 0.725, 0.4219],
+            #"num_inference_steps": 8,
+            #"guidance_scale": [1.0] * 3,
+            #"stg_scale": [0.0] * 3,
+            #"rescaling_scale": [1.0] * 3,
+            #"skip_block_list": [[42] for i in range(3)],
+        }
 
     # Add optional parameters
     if args.negative_prompt:
