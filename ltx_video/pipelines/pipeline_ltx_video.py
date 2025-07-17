@@ -266,7 +266,7 @@ class ConditioningItem:
     Attributes:
         media_item (torch.Tensor): The conditioning data in pixel space.
             - For all types: shape=(b, 3, f, h, w) where b=batch, f=frames, h=height, w=width
-            - Guiding latents should be passed as pixel-space videos (depth/pose/etc)
+            - Guiding latents can be passed as pixel-space videos (depth/pose/etc) or already-encoded videos
         conditioning_type (str): Type of conditioning - "image", "video", or "guiding"
         media_frame_number (int): The start-frame number in the generated video
         conditioning_strength (float): The strength of the conditioning (0.0-1.0)
@@ -280,6 +280,13 @@ class ConditioningItem:
     conditioning_strength: float = 1.0
     media_x: Optional[int] = None
     media_y: Optional[int] = None
+
+    @property
+    def is_latent_space(self) -> bool:
+        """
+        Returns true if the item is already in latent space.
+        """
+        return self.media_item.shape[1] not in [3, 1]
 
 
 class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
@@ -1095,6 +1102,12 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 use_guiding_latents=use_guiding_latents,
                 guiding_strength=guiding_strength,
                 temporal_adain_factor=temporal_adain_factor,
+                encode_tiling=encode_tiling,
+                encode_tile_size=encode_tile_size,
+                encode_tile_stride=encode_tile_stride,
+                decode_tiling=decode_tiling,
+                decode_tile_size=decode_tile_size,
+                decode_tiling_stride=decode_tile_stride,
                 **kwargs,
             )
 
@@ -1105,8 +1118,10 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         latent_height = height // self.vae_scale_factor
         latent_width = width // self.vae_scale_factor
         latent_num_frames = num_frames // self.video_scale_factor
+
         if isinstance(self.vae, CausalVideoAutoencoder) and is_video:
             latent_num_frames += 1
+
         latent_shape = (
             batch_size * num_images_per_prompt,
             self.transformer.config.in_channels,
@@ -1503,35 +1518,14 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             // math.prod(self.patchifier.patch_size),
         )
         if output_type != "latent":
-            if self.vae.decoder.timestep_conditioning:
-                noise = torch.randn_like(latents)
-                if not isinstance(decode_timestep, list):
-                    decode_timestep = [decode_timestep] * latents.shape[0]
-                if decode_noise_scale is None:
-                    decode_noise_scale = decode_timestep
-                elif not isinstance(decode_noise_scale, list):
-                    decode_noise_scale = [decode_noise_scale] * latents.shape[0]
-
-                decode_timestep = torch.tensor(decode_timestep).to(latents.device)
-                decode_noise_scale = torch.tensor(decode_noise_scale).to(
-                    latents.device
-                )[:, None, None, None, None]
-                latents = (
-                    latents * (1 - decode_noise_scale) + noise * decode_noise_scale
-                )
-            else:
-                decode_timestep = None
-
             latents = self.tone_map_latents(latents, tone_map_compression_ratio)
-            image = vae_decode(
+            image = self._vae_decode(
                 latents,
-                self.vae,
-                is_video,
                 vae_per_channel_normalize=kwargs["vae_per_channel_normalize"],
-                timestep=decode_timestep,
-                use_tiling=decode_tiling,
-                tile_size=decode_tile_size,
-                tile_stride=decode_tile_stride,
+                decode_timestep=decode_timestep,
+                decode_tiling=decode_tiling,
+                decode_tile_size=decode_tile_size,
+                decode_tile_stride=decode_tile_stride,
             )
 
             image = self.image_processor.postprocess(image, output_type=output_type)
@@ -1645,15 +1639,15 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 b, c, n_frames, h, w = media_item.shape
 
                 # Check if media item is already in latent space (more than 3 channels indicates encoded)
-                is_already_encoded = c > 3
-                logger.debug(
-                    f"DEBUG: Processing conditioning type={conditioning_type}, shape={media_item.shape}, channels={c}, is_encoded={is_already_encoded}"
+                is_already_encoded = conditioning_item.is_latent_space
+                logger.info(
+                    f"Processing conditioning type={conditioning_type}, shape={media_item.shape}, channels={c}, is_encoded={is_already_encoded}"
                 )
 
                 if is_already_encoded:
                     # Media item is already in latent space, use directly
                     media_item_latents = media_item.to(dtype=init_latents.dtype)
-                    logger.debug(
+                    logger.info(
                         f"Using pre-encoded guiding latents: {media_item.shape}, frame_number={media_frame_number}"
                     )
                 else:
@@ -1861,218 +1855,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             extra_conditioning_num_latents,
         )
 
-    def prepare_conditioning(
-        self,
-        conditioning_items: Optional[List[ConditioningItem]],
-        init_latents: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-        vae_per_channel_normalize: bool = False,
-        encode_tiling: bool = False,
-        encode_tile_size: tuple = (512, 512),
-        encode_tile_stride: tuple = (256, 256),
-        generator=None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """
-        Prepare conditioning tokens based on the provided conditioning items.
-
-        This method encodes provided conditioning items (video frames or single frames) into latents
-        and integrates them with the initial latent tensor. It also calculates corresponding pixel
-        coordinates, a mask indicating the influence of conditioning latents, and the total number of
-        conditioning latents.
-
-        Args:
-            conditioning_items (Optional[List[ConditioningItem]]): A list of ConditioningItem objects.
-            init_latents (torch.Tensor): The initial latent tensor of shape (b, c, f_l, h_l, w_l), where
-                `f_l` is the number of latent frames, and `h_l` and `w_l` are latent spatial dimensions.
-            num_frames, height, width: The dimensions of the generated video.
-            vae_per_channel_normalize (bool, optional): Whether to normalize channels during VAE encoding.
-                Defaults to `False`.
-            generator: The random generator
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-                - `init_latents` (torch.Tensor): The updated latent tensor including conditioning latents,
-                  patchified into (b, n, c) shape.
-                - `init_pixel_coords` (torch.Tensor): The pixel coordinates corresponding to the updated
-                  latent tensor.
-                - `conditioning_mask` (torch.Tensor): A mask indicating the conditioning-strength of each
-                  latent token.
-                - `num_cond_latents` (int): The total number of latent tokens added from conditioning items.
-
-        Raises:
-            AssertionError: If input shapes, dimensions, or conditions for applying conditioning are invalid.
-        """
-        assert isinstance(self.vae, CausalVideoAutoencoder)
-
-        if conditioning_items:
-            batch_size, _, num_latent_frames = init_latents.shape[:3]
-
-            init_conditioning_mask = torch.zeros(
-                init_latents[:, 0, :, :, :].shape,
-                dtype=torch.float32,
-                device=init_latents.device,
-            )
-
-            extra_conditioning_latents = []
-            extra_conditioning_pixel_coords = []
-            extra_conditioning_mask = []
-            extra_conditioning_num_latents = 0  # Number of extra conditioning latents added (should be removed before decoding)
-
-            # Process each conditioning item
-            for conditioning_item in conditioning_items:
-                conditioning_item = self._resize_conditioning_item(
-                    conditioning_item, height, width
-                )
-                media_item = conditioning_item.media_item
-                media_frame_number = conditioning_item.media_frame_number
-                strength = conditioning_item.conditioning_strength
-                assert media_item.ndim == 5  # (b, c, f, h, w)
-                b, c, n_frames, h, w = media_item.shape
-                assert (
-                    height == h and width == w
-                ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {h}x{w} - allowed only when media_frame_number == 0"
-                assert n_frames % 8 == 1
-                assert (
-                    media_frame_number >= 0
-                    and media_frame_number + n_frames <= num_frames
-                )
-
-                # Encode the provided conditioning media item
-                media_item_latents = vae_encode(
-                    media_item.to(dtype=self.vae.dtype, device=self.vae.device),
-                    self.vae,
-                    vae_per_channel_normalize=vae_per_channel_normalize,
-                    use_tiling=encode_tiling,
-                    tile_size=encode_tile_size,
-                    tile_stride=encode_tile_stride,
-                ).to(dtype=init_latents.dtype)
-
-                # Handle the different conditioning cases
-                if media_frame_number == 0:
-                    # Get the target spatial position of the latent conditioning item
-                    media_item_latents, l_x, l_y = self._get_latent_spatial_position(
-                        media_item_latents,
-                        conditioning_item,
-                        height,
-                        width,
-                        strip_latent_border=True,
-                    )
-                    b, c_l, f_l, h_l, w_l = media_item_latents.shape
-
-                    # First frame or sequence - just update the initial noise latents and the mask
-                    init_latents[:, :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l] = (
-                        torch.lerp(
-                            init_latents[:, :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l],
-                            media_item_latents,
-                            strength,
-                        )
-                    )
-                    init_conditioning_mask[
-                        :, :f_l, l_y : l_y + h_l, l_x : l_x + w_l
-                    ] = strength
-                else:
-                    # Non-first frame or sequence
-                    if n_frames > 1:
-                        # Handle non-first sequence.
-                        # Encoded latents are either fully consumed, or the prefix is handled separately below.
-                        (
-                            init_latents,
-                            init_conditioning_mask,
-                            media_item_latents,
-                        ) = self._handle_non_first_conditioning_sequence(
-                            init_latents,
-                            init_conditioning_mask,
-                            media_item_latents,
-                            media_frame_number,
-                            strength,
-                        )
-
-                    # Single frame or sequence-prefix latents
-                    if media_item_latents is not None:
-                        noise = randn_tensor(
-                            media_item_latents.shape,
-                            generator=generator,
-                            device=media_item_latents.device,
-                            dtype=media_item_latents.dtype,
-                        )
-
-                        media_item_latents = torch.lerp(
-                            noise, media_item_latents, strength
-                        )
-
-                        # Patchify the extra conditioning latents and calculate their pixel coordinates
-                        media_item_latents, latent_coords = self.patchifier.patchify(
-                            latents=media_item_latents
-                        )
-                        pixel_coords = latent_to_pixel_coords(
-                            latent_coords,
-                            self.vae,
-                            causal_fix=self.transformer.config.causal_temporal_positioning,
-                        )
-
-                        # Update the frame numbers to match the target frame number
-                        pixel_coords[:, 0] += media_frame_number
-                        extra_conditioning_num_latents += media_item_latents.shape[1]
-
-                        conditioning_mask = torch.full(
-                            media_item_latents.shape[:2],
-                            strength,
-                            dtype=torch.float32,
-                            device=init_latents.device,
-                        )
-
-                        extra_conditioning_latents.append(media_item_latents)
-                        extra_conditioning_pixel_coords.append(pixel_coords)
-                        extra_conditioning_mask.append(conditioning_mask)
-
-        # Patchify the updated latents and calculate their pixel coordinates
-        init_latents, init_latent_coords = self.patchifier.patchify(
-            latents=init_latents
-        )
-        init_pixel_coords = latent_to_pixel_coords(
-            init_latent_coords,
-            self.vae,
-            causal_fix=self.transformer.config.causal_temporal_positioning,
-        )
-
-        if not conditioning_items:
-            return init_latents, init_pixel_coords, None, 0
-
-        init_conditioning_mask, _ = self.patchifier.patchify(
-            latents=init_conditioning_mask.unsqueeze(1)
-        )
-        init_conditioning_mask = init_conditioning_mask.squeeze(-1)
-
-        if extra_conditioning_latents:
-            # Stack the extra conditioning latents, pixel coordinates and mask
-            init_latents = torch.cat([*extra_conditioning_latents, init_latents], dim=1)
-            init_pixel_coords = torch.cat(
-                [*extra_conditioning_pixel_coords, init_pixel_coords], dim=2
-            )
-            init_conditioning_mask = torch.cat(
-                [*extra_conditioning_mask, init_conditioning_mask], dim=1
-            )
-
-            if self.transformer.use_tpu_flash_attention:
-                # When flash attention is used, keep the original number of tokens by removing
-                #   tokens from the end.
-                init_latents = init_latents[:, :-extra_conditioning_num_latents]
-                init_pixel_coords = init_pixel_coords[
-                    :, :, :-extra_conditioning_num_latents
-                ]
-                init_conditioning_mask = init_conditioning_mask[
-                    :, :-extra_conditioning_num_latents
-                ]
-
-        return (
-            init_latents,
-            init_pixel_coords,
-            init_conditioning_mask,
-            extra_conditioning_num_latents,
-        )
-
     @staticmethod
     def _resize_conditioning_item(
         conditioning_item: ConditioningItem,
@@ -2104,6 +1886,11 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         """
         scale = self.vae_scale_factor
         h, w = conditioning_item.media_item.shape[-2:]
+
+        if conditioning_item.is_latent_space:
+            h = h * scale
+            w = w * scale
+
         assert (
             h <= height and w <= width
         ), f"Conditioning item size {h}x{w} is larger than target size {height}x{width}"
@@ -2116,6 +1903,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         x_start = (width - w) // 2 if x_start is None else x_start
         y_start = (height - h) // 2 if y_start is None else y_start
         x_end, y_end = x_start + w, y_start + h
+
         assert (
             x_end <= width and y_end <= height
         ), f"Conditioning item {x_start}:{x_end}x{y_start}:{y_end} is out of bounds for target size {width}x{height}"
@@ -2345,9 +2133,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             chunk_ends = chunk_ends[:-1]
             chunk_ends[-1] = num_frames
 
-        logger.debug(f"Temporal tiling: {len(chunk_starts)} chunks")
+        logger.info(f"Temporal tiling: {len(chunk_starts)} chunks")
         for i, (start, end) in enumerate(zip(chunk_starts, chunk_ends)):
-            logger.debug(f"  Chunk {i+1}: frames {start}-{end} ({end-start} frames)")
+            logger.info(f"  Chunk {i+1}: frames {start}-{end} ({end-start} frames)")
 
         # Store original generator state for reproducibility
         original_generator_state = None
@@ -2362,7 +2150,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         ):
             chunk_num_frames = end_frame - start_frame
 
-            logger.debug(
+            logger.info(
                 f"Processing chunk {chunk_idx + 1}/{len(chunk_starts)}: frames {start_frame}-{end_frame}"
             )
 
@@ -2407,57 +2195,65 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
                 overlap_latents = prev_latents[:, :, -latent_overlap_frames:]
 
-                try:
-                    overlap_pixels = vae_decode(
-                        overlap_latents,
-                        self.vae,
-                        is_video=True,
-                        vae_per_channel_normalize=kwargs.get(
-                            "vae_per_channel_normalize", True
-                        ),
-                        timestep=torch.tensor([0.0], device=overlap_latents.device),
-                    )
+                if use_guiding_latents:
+                    try:
+                        """
+                        overlap_pixels = self._vae_decode(
+                            overlap_latents,
+                            vae_per_channel_normalize=kwargs.get(
+                                "vae_per_channel_normalize", True
+                            ),
+                            decode_timestep=kwargs.get("decode_timestep", 0.0),
+                            decode_noise_scale=kwargs.get("decode_noise_scale", 0.0),
+                            decode_tiling=kwargs.get("decode_tiling", False),
+                            decode_tile_size=kwargs.get("decode_tile_size", (64, 64)),
+                            decode_tile_stride=kwargs.get("decode_tile_stride", (32, 32)),
+                        )
+                        """
+                        overlap_item = ConditioningItem(
+                            media_item=overlap_latents.clone(),
+                            conditioning_type="guiding",
+                            media_frame_number=0,  # Condition at start of new chunk
+                            conditioning_strength=temporal_overlap_strength,
+                        )
+                        chunk_conditioning_items.append(overlap_item)
+                        logger.info(
+                            f"  Added overlap conditioning: {overlap_item.media_item.shape}"
+                        )
 
-                    # Create conditioning item for overlap - Updated to use new approach
-                    overlap_item = ConditioningItem(
-                        media_item=overlap_pixels,
-                        conditioning_type="video",
-                        media_frame_number=0,  # Condition at start of new chunk
-                        conditioning_strength=temporal_overlap_strength,
-                    )
-                    chunk_conditioning_items.append(overlap_item)
-                    logger.debug(
-                        f"  Added overlap conditioning: {overlap_pixels.shape}"
-                    )
-
-                except Exception as e:
-                    logger.debug(
-                        f"  Warning: Failed to create overlap conditioning: {e}"
-                    )
+                    except Exception as e:
+                        logger.info(
+                            f"  Warning: Failed to create overlap conditioning: {e}"
+                        )
 
             # Add guiding latents for this chunk if specified
-            if use_guiding_latents and kwargs.get("conditioning_items"):
+            if kwargs.get("conditioning_items"):
                 for item in kwargs["conditioning_items"]:
                     if item.conditioning_type in ["guiding", "guiding_latents"]:
                         # First, encode the guiding video to latent space if not already done
                         if not hasattr(item, "_encoded_latents"):
-                            item._encoded_latents = vae_encode(
-                                item.media_item.to(
-                                    dtype=self.vae.dtype, device=self.vae.device
-                                ),
-                                self.vae,
-                                vae_per_channel_normalize=kwargs.get(
-                                    "vae_per_channel_normalize", True
-                                ),
-                                use_tiling=kwargs.get("encode_tiling", False),
-                                tile_size=kwargs.get("encode_tile_size", (512, 512)),
-                                tile_stride=kwargs.get(
-                                    "encode_tile_stride", (256, 256)
-                                ),
-                            ).to(dtype=torch.float32)
-                            logger.debug(
-                                f"  Encoded guiding video: {item.media_item.shape} -> {item._encoded_latents.shape}"
-                            )
+                            if item.is_latent_space:
+                                item._encoded_latents = item.media_item
+                            else:
+                                item._encoded_latents = vae_encode(
+                                    item.media_item.to(
+                                        dtype=self.vae.dtype, device=self.vae.device
+                                    ),
+                                    self.vae,
+                                    vae_per_channel_normalize=kwargs.get(
+                                        "vae_per_channel_normalize", True
+                                    ),
+                                    use_tiling=kwargs.get("encode_tiling", False),
+                                    tile_size=kwargs.get(
+                                        "encode_tile_size", (512, 512)
+                                    ),
+                                    tile_stride=kwargs.get(
+                                        "encode_tile_stride", (256, 256)
+                                    ),
+                                ).to(dtype=torch.float32)
+                                logger.info(
+                                    f"  Encoded guiding video: {item.media_item.shape} -> {item._encoded_latents.shape}"
+                                )
 
                         # Now work in latent space for all calculations
                         latent_item_start_frame = (
@@ -2520,7 +2316,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                                 )
                                 chunk_item.conditioning_strength = guiding_strength
                                 chunk_conditioning_items.append(chunk_item)
-                                logger.debug(
+                                logger.info(
                                     f"  Added guiding conditioning: {chunk_item.media_item.shape} (latent space, chunk {chunk_idx+1})"
                                 )
 
@@ -2577,13 +2373,13 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         :, :, latent_chunk_start:latent_chunk_end
                     ]
                     chunk_kwargs["latents"] = chunk_latents
-                    logger.debug(
+                    logger.info(
                         f"  Using sliced latents: {chunk_latents.shape} (from {latent_chunk_start}:{latent_chunk_end})"
                     )
                 else:
                     # No latents for this chunk, remove the parameter
                     chunk_kwargs.pop("latents", None)
-                    logger.debug(f"  No latents available for chunk {chunk_idx+1}")
+                    logger.info(f"  No latents available for chunk {chunk_idx+1}")
             else:
                 # No initialization latents provided
                 if chunk_idx > 0:
@@ -2686,7 +2482,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             kwargs["generator"].set_state(original_generator_state)
 
         # Combine chunks with overlap blending
-        logger.debug("Combining chunks with temporal blending...")
+        logger.info("Combining chunks with temporal blending...")
         final_output = self._combine_temporal_chunks(
             output_chunks,
             chunk_starts,
@@ -2700,6 +2496,49 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             return ImagePipelineOutput(images=final_output)
         else:
             return (final_output,)
+
+    def _vae_decode(
+        self,
+        latents: torch.Tensor,
+        decode_timestep: Union[List[float], float] = 0.0,
+        decode_noise_scale: Optional[List[float]] = None,
+        decode_tiling: bool = False,
+        decode_tile_size: Tuple[int, int] = (64, 64),
+        decode_tile_stride: Tuple[int, int] = (32, 32),
+        vae_per_channel_normalize: bool = True,
+    ) -> torch.Tensor:
+        """
+        Decodes.
+        """
+        if self.vae.decoder.timestep_conditioning:
+            noise = torch.randn_like(latents)
+            if not isinstance(decode_timestep, list):
+                decode_timestep = [decode_timestep] * latents.shape[0]
+            if decode_noise_scale is None:
+                decode_noise_scale = decode_timestep
+            elif not isinstance(decode_noise_scale, list):
+                decode_noise_scale = [decode_noise_scale] * latents.shape[0]
+
+            decode_timestep = torch.tensor(decode_timestep).to(latents.device)
+            decode_noise_scale = torch.tensor(decode_noise_scale).to(latents.device)[
+                :, None, None, None, None
+            ]
+            latents = latents * (1 - decode_noise_scale) + noise * decode_noise_scale
+        else:
+            decode_timestep = None
+
+        image = vae_decode(
+            latents,
+            self.vae,
+            True,
+            vae_per_channel_normalize=vae_per_channel_normalize,
+            timestep=decode_timestep,
+            use_tiling=decode_tiling,
+            tile_size=decode_tile_size,
+            tile_stride=decode_tile_stride,
+        )
+
+        return image
 
     @staticmethod
     def tone_map_latents(
@@ -2871,6 +2710,8 @@ class LTXMultiScalePipeline:
         downscale_factor: float,
         first_pass: dict,
         second_pass: dict,
+        second_pass_noise_scale: float = 0.0,
+        tone_map_compression_ratio: float = 0.0,
         *args: Any,
         **kwargs: Any,
     ) -> Any:
@@ -2896,16 +2737,31 @@ class LTXMultiScalePipeline:
 
         result = self.video_pipeline(*args, **kwargs)
         latents = result.images
+        latents = self.video_pipeline.tone_map_latents(
+            latents, tone_map_compression_ratio
+        )
 
         upsampled_latents = self._upsample_latents(self.latent_upsampler, latents)
         upsampled_latents = adain_filter_latent(
             latents=upsampled_latents, reference_latents=latents
         )
 
+        if second_pass_noise_scale > 0:
+            noise = torch.randn(
+                upsampled_latents.shape,
+                device=upsampled_latents.device,
+                dtype=upsampled_latents.dtype,
+                generator=kwargs.get("generator"),
+            )
+            upsampled_latents = (
+                upsampled_latents * (1 - second_pass_noise_scale) + noise * noise_scale
+            )
+
         kwargs = original_kwargs
 
         second_pass_height = downscaled_height * 2
         second_pass_width = downscaled_width * 2
+
         kwargs["latents"] = upsampled_latents
         kwargs["output_type"] = original_output_type
         kwargs["width"] = second_pass_width
