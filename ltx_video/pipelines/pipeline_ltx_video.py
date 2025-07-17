@@ -281,19 +281,6 @@ class ConditioningItem:
     media_x: Optional[int] = None
     media_y: Optional[int] = None
 
-    def deep_copy(self) -> "ConditioningItem":
-        """
-        Create a deep copy of the ConditioningItem instance.
-        """
-        return ConditioningItem(
-            media_item=self.media_item.clone(),
-            conditioning_type=self.conditioning_type,
-            media_frame_number=self.media_frame_number,
-            conditioning_strength=self.conditioning_strength,
-            media_x=self.media_x,
-            media_y=self.media_y,
-        )
-
 
 class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
     r"""
@@ -740,6 +727,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         device: torch.device,
         generator: torch.Generator | List[torch.Generator],
         vae_per_channel_normalize: bool = True,
+        encode_tiling: bool = False,
+        encode_tile_size: tuple[int, int] = (512, 512),
+        encode_tile_stride: tuple[int, int] = (256, 256),
     ):
         """
         Prepare the initial latent tensor to be denoised.
@@ -785,6 +775,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 media_items.to(dtype=self.vae.dtype, device=self.vae.device),
                 self.vae,
                 vae_per_channel_normalize=vae_per_channel_normalize,
+                use_tiling=encode_tiling,
+                tile_size=encode_tile_size,
+                tile_stride=encode_tile_stride,
             )
         if latents is not None:
             assert (
@@ -911,6 +904,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         decode_tile_size: Tuple[int, int] = (64, 64),
         decode_tile_stride: Tuple[int, int] = (32, 32),
         tone_map_compression_ratio: float = 0.0,
+        encode_tiling: bool = False,
+        encode_tile_size: Tuple[int, int] = (512, 512),
+        encode_tile_stride: Tuple[int, int] = (256, 256),
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         """
@@ -1274,6 +1270,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             device=device,
             generator=generator,
             vae_per_channel_normalize=vae_per_channel_normalize,
+            encode_tiling=encode_tiling,
+            encode_tile_size=encode_tile_size,
+            encode_tile_stride=encode_tile_stride,
         )
 
         # Handle all conditioning through the unified interface
@@ -1285,6 +1284,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 height=height,
                 width=width,
                 vae_per_channel_normalize=vae_per_channel_normalize,
+                encode_tiling=encode_tiling,
+                encode_tile_size=encode_tile_size,
+                encode_tile_stride=encode_tile_stride,
                 generator=generator,
             )
         )
@@ -1588,6 +1590,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         height: int,
         width: int,
         vae_per_channel_normalize: bool = False,
+        encode_tiling: bool = False,
+        encode_tile_size: tuple = (512, 512),
+        encode_tile_stride: tuple = (256, 256),
         generator=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
@@ -1673,6 +1678,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         media_item.to(dtype=self.vae.dtype, device=self.vae.device),
                         self.vae,
                         vae_per_channel_normalize=vae_per_channel_normalize,
+                        use_tiling=encode_tiling,
+                        tile_size=encode_tile_size,
+                        tile_stride=encode_tile_stride,
                     ).to(dtype=init_latents.dtype)
 
                 # Handle the different conditioning cases
@@ -1861,6 +1869,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         height: int,
         width: int,
         vae_per_channel_normalize: bool = False,
+        encode_tiling: bool = False,
+        encode_tile_size: tuple = (512, 512),
+        encode_tile_stride: tuple = (256, 256),
         generator=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
@@ -1933,6 +1944,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     media_item.to(dtype=self.vae.dtype, device=self.vae.device),
                     self.vae,
                     vae_per_channel_normalize=vae_per_channel_normalize,
+                    use_tiling=encode_tiling,
+                    tile_size=encode_tile_size,
+                    tile_stride=encode_tile_stride,
                 ).to(dtype=init_latents.dtype)
 
                 # Handle the different conditioning cases
@@ -2435,6 +2449,11 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                                 vae_per_channel_normalize=kwargs.get(
                                     "vae_per_channel_normalize", True
                                 ),
+                                use_tiling=kwargs.get("encode_tiling", False),
+                                tile_size=kwargs.get("encode_tile_size", (512, 512)),
+                                tile_stride=kwargs.get(
+                                    "encode_tile_stride", (256, 256)
+                                ),
                             ).to(dtype=torch.float32)
                             logger.debug(
                                 f"  Encoded guiding video: {item.media_item.shape} -> {item._encoded_latents.shape}"
@@ -2606,6 +2625,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         vae_per_channel_normalize=kwargs.get(
                             "vae_per_channel_normalize", True
                         ),
+                        encode_tiling=kwargs.get("encode_tiling", False),
+                        encode_tile_size=kwargs.get("encode_tile_size", (512, 512)),
+                        encode_tile_stride=kwargs.get("encode_tile_stride", (256, 256)),
                     )
 
                     # Store initialization latents for potential use in conditioning

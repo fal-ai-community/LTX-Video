@@ -1,12 +1,8 @@
 from typing import Tuple
+
 import torch
 from diffusers import AutoencoderKL
 from einops import rearrange, repeat
-from torch import Tensor
-from math import ceil
-from tqdm import tqdm
-
-
 from ltx_video.models.autoencoders.causal_video_autoencoder import (
     CausalVideoAutoencoder,
 )
@@ -14,6 +10,8 @@ from ltx_video.models.autoencoders.video_autoencoder import (
     Downsample3D,
     VideoAutoencoder,
 )
+from torch import Tensor
+from tqdm import tqdm
 
 try:
     import torch_xla.core.xla_model as xm
@@ -118,7 +116,7 @@ def build_mask(
 
         mask = torch.stack([h, w]).min(dim=0).values
         mask = rearrange(mask, "H W -> 1 1 H W")
-    
+
     return mask
 
 
@@ -137,7 +135,7 @@ def tiled_encode(
         media_items: Input tensor [B, C, H, W] or [B, C, T, H, W]
         vae: VAE model
         tile_size: Size of each tile (height, width)
-        tile_stride: Stride between tiles (height, width)  
+        tile_stride: Stride between tiles (height, width)
         vae_per_channel_normalize: Whether to use per-channel normalization
 
     Returns:
@@ -146,7 +144,7 @@ def tiled_encode(
     is_video_shaped = media_items.dim() == 5
     device = media_items.device
     dtype = media_items.dtype
-    
+
     if is_video_shaped:
         batch_size, channels, num_frames, height, width = media_items.shape
         # For video VAEs, process the full video; for image VAEs, process frame by frame
@@ -155,12 +153,12 @@ def tiled_encode(
             H, W = height, width
             size_h, size_w = tile_size
             stride_h, stride_w = tile_stride
-            
+
             size_h = min(size_h, H)
             size_w = min(size_w, W)
             stride_h = min(stride_h, size_h)
             stride_w = min(stride_w, size_w)
-            
+
             # Create tiles
             tasks = sliding_2d_windows(
                 height=H,
@@ -168,33 +166,43 @@ def tiled_encode(
                 tile_size=(size_w, size_h),
                 tile_stride=(stride_w, stride_h),
             )
-            
+
             # Get output dimensions from VAE scaling
             temporal_scale, spatial_scale, _ = get_vae_size_scale_factor(vae)
             out_h = H // spatial_scale
             out_w = W // spatial_scale
-            
+
             # Determine actual latent dimensions by encoding a test tile
             test_input = media_items[:1, :, :, :size_h, :size_w].to(vae.dtype)
             with torch.no_grad():
                 test_latent = vae.encode(test_input).latent_dist.sample()
                 latent_channels = test_latent.shape[1]
                 out_t = test_latent.shape[2]  # Use actual temporal dimension from VAE
-            
+
             # Initialize accumulation tensors
-            weight = torch.zeros((1, 1, out_t, out_h, out_w), dtype=dtype, device=device)
-            values = torch.zeros((batch_size, latent_channels, out_t, out_h, out_w), dtype=dtype, device=device)
-            
+            weight = torch.zeros(
+                (1, 1, out_t, out_h, out_w), dtype=dtype, device=device
+            )
+            values = torch.zeros(
+                (batch_size, latent_channels, out_t, out_h, out_w),
+                dtype=dtype,
+                device=device,
+            )
+
             # Process each tile
-            for h, h_, w, w_ in tasks:
+            for h, h_, w, w_ in tqdm(
+                tasks, desc="Encoding", total=len(tasks), unit="tile"
+            ):
                 # Extract tile
                 tile = media_items[:, :, :, h:h_, w:w_].to(vae.dtype)
-                
+
                 # Encode tile
                 tile_latent = vae.encode(tile).latent_dist.sample()
-                tile_latent = normalize_latents(tile_latent, vae, vae_per_channel_normalize)
+                tile_latent = normalize_latents(
+                    tile_latent, vae, vae_per_channel_normalize
+                )
                 tile_latent = tile_latent.to(dtype).to(device)
-                
+
                 # Create mask for blending
                 mask = build_mask(
                     tile_latent,
@@ -204,15 +212,19 @@ def tiled_encode(
                         (size_w - stride_w) // spatial_scale,
                     ),
                 ).to(dtype=dtype, device=device)
-                
+
                 # Add to accumulation
                 target_h = h // spatial_scale
                 target_w = w // spatial_scale
                 tile_h, tile_w = tile_latent.shape[-2:]
-                
-                values[:, :, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += tile_latent * mask
-                weight[:, :, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += mask
-            
+
+                values[
+                    :, :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+                ] += (tile_latent * mask)
+                weight[
+                    :, :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+                ] += mask
+
             # Normalize by weights
             latents = values / weight
             return latents
@@ -231,12 +243,12 @@ def tiled_encode(
         H, W = height, width
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
-        
+
         size_h = min(size_h, H)
         size_w = min(size_w, W)
         stride_h = min(stride_h, size_h)
         stride_w = min(stride_w, size_w)
-        
+
         # Create tiles
         tasks = sliding_2d_windows(
             height=H,
@@ -244,32 +256,34 @@ def tiled_encode(
             tile_size=(size_w, size_h),
             tile_stride=(stride_w, stride_h),
         )
-        
+
         # Get output dimensions
         _, spatial_scale, _ = get_vae_size_scale_factor(vae)
         out_h = H // spatial_scale
         out_w = W // spatial_scale
-        
+
         # Determine latent channels
         test_input = media_items[:1, :, :size_h, :size_w].to(vae.dtype)
         with torch.no_grad():
             test_latent = vae.encode(test_input).latent_dist.sample()
             latent_channels = test_latent.shape[1]
-        
+
         # Initialize accumulation tensors
         weight = torch.zeros((1, 1, out_h, out_w), dtype=dtype, device=device)
-        values = torch.zeros((batch_size, latent_channels, out_h, out_w), dtype=dtype, device=device)
-        
+        values = torch.zeros(
+            (batch_size, latent_channels, out_h, out_w), dtype=dtype, device=device
+        )
+
         # Process each tile
         for h, h_, w, w_ in tasks:
             # Extract tile
             tile = media_items[:, :, h:h_, w:w_].to(vae.dtype)
-            
+
             # Encode tile
             tile_latent = vae.encode(tile).latent_dist.sample()
             tile_latent = normalize_latents(tile_latent, vae, vae_per_channel_normalize)
             tile_latent = tile_latent.to(dtype).to(device)
-            
+
             # Create mask for blending
             mask = build_mask(
                 tile_latent,
@@ -279,15 +293,19 @@ def tiled_encode(
                     (size_w - stride_w) // spatial_scale,
                 ),
             ).to(dtype=dtype, device=device)
-            
+
             # Add to accumulation
             target_h = h // spatial_scale
             target_w = w // spatial_scale
             tile_h, tile_w = tile_latent.shape[-2:]
-            
-            values[:, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += tile_latent * mask
-            weight[:, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += mask
-        
+
+            values[
+                :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+            ] += (tile_latent * mask)
+            weight[
+                :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+            ] += mask
+
         # Normalize by weights
         latents = values / weight
         return latents
@@ -321,21 +339,21 @@ def tiled_decode(
     is_video_shaped = latents.dim() == 5
     device = latents.device
     dtype = latents.dtype
-    
+
     if is_video_shaped:
         batch_size, channels, num_frames, height, width = latents.shape
-        
+
         if isinstance(vae, (VideoAutoencoder, CausalVideoAutoencoder)):
             # Video VAE can handle temporal dimension
             H, W = height, width
             size_h, size_w = tile_size
             stride_h, stride_w = tile_stride
-            
+
             size_h = min(size_h, H)
             size_w = min(size_w, W)
             stride_h = min(stride_h, size_h)
             stride_w = min(stride_w, size_w)
-            
+
             # Create tiles
             tasks = sliding_2d_windows(
                 height=H,
@@ -343,57 +361,69 @@ def tiled_decode(
                 tile_size=(size_w, size_h),
                 tile_stride=(stride_w, stride_h),
             )
-            
+
             # Get output dimensions from actual VAE decode
             temporal_scale, spatial_scale, _ = get_vae_size_scale_factor(vae)
             out_h = H * spatial_scale
             out_w = W * spatial_scale
-            
+
             # Determine actual output dimensions by decoding a test tile
             test_latent = latents[:1, :, :, :size_h, :size_w]
-            test_latent = un_normalize_latents(test_latent, vae, vae_per_channel_normalize)
-            
+            test_latent = un_normalize_latents(
+                test_latent, vae, vae_per_channel_normalize
+            )
+
             decode_kwargs = {"return_dict": False}
             if timestep is not None:
                 decode_kwargs["timestep"] = timestep
             if isinstance(vae, (VideoAutoencoder, CausalVideoAutoencoder)):
                 decode_kwargs["target_shape"] = (
-                    1, 3,
+                    1,
+                    3,
                     test_latent.shape[2] * temporal_scale if is_video else 1,
                     test_latent.shape[3] * spatial_scale,
                     test_latent.shape[4] * spatial_scale,
                 )
-            
+
             with torch.no_grad():
                 test_decoded = vae.decode(test_latent.to(vae.dtype), **decode_kwargs)[0]
                 out_t = test_decoded.shape[2]  # Use actual temporal dimension from VAE
-            
+
             # Initialize accumulation tensors
-            weight = torch.zeros((1, 1, out_t, out_h, out_w), dtype=dtype, device=device)
-            values = torch.zeros((batch_size, 3, out_t, out_h, out_w), dtype=dtype, device=device)
-            
+            weight = torch.zeros(
+                (1, 1, out_t, out_h, out_w), dtype=dtype, device=device
+            )
+            values = torch.zeros(
+                (batch_size, 3, out_t, out_h, out_w), dtype=dtype, device=device
+            )
+
             # Process each tile
-            for h, h_, w, w_ in tqdm(tasks, desc="Decoding", total=len(tasks), unit="tile"):
+            for h, h_, w, w_ in tqdm(
+                tasks, desc="Decoding", total=len(tasks), unit="tile"
+            ):
                 # Extract tile
                 tile_latent = latents[:, :, :, h:h_, w:w_]
-                
+
                 # Decode tile
-                tile_latent = un_normalize_latents(tile_latent, vae, vae_per_channel_normalize)
-                
+                tile_latent = un_normalize_latents(
+                    tile_latent, vae, vae_per_channel_normalize
+                )
+
                 decode_kwargs = {"return_dict": False}
                 if timestep is not None:
                     decode_kwargs["timestep"] = timestep
                 if isinstance(vae, (VideoAutoencoder, CausalVideoAutoencoder)):
                     decode_kwargs["target_shape"] = (
-                        1, 3,
+                        1,
+                        3,
                         tile_latent.shape[2] * temporal_scale if is_video else 1,
                         tile_latent.shape[3] * spatial_scale,
                         tile_latent.shape[4] * spatial_scale,
                     )
-                
+
                 tile_decoded = vae.decode(tile_latent.to(vae.dtype), **decode_kwargs)[0]
                 tile_decoded = tile_decoded.to(dtype).to(device)
-                
+
                 # Create mask for blending
                 mask = build_mask(
                     tile_decoded,
@@ -403,15 +433,19 @@ def tiled_decode(
                         (size_w - stride_w) * spatial_scale,
                     ),
                 ).to(dtype=dtype, device=device)
-                
+
                 # Add to accumulation
                 target_h = h * spatial_scale
                 target_w = w * spatial_scale
                 tile_h, tile_w = tile_decoded.shape[-2:]
-                
-                values[:, :, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += tile_decoded * mask
-                weight[:, :, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += mask
-            
+
+                values[
+                    :, :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+                ] += (tile_decoded * mask)
+                weight[
+                    :, :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+                ] += mask
+
             # Normalize by weights
             decoded = values / weight
             return decoded
@@ -419,7 +453,13 @@ def tiled_decode(
             # Image VAE - process frame by frame
             latents = rearrange(latents, "b c t h w -> (b t) c h w")
             decoded = tiled_decode(
-                latents, vae, tile_size, tile_stride, is_video, vae_per_channel_normalize, timestep
+                latents,
+                vae,
+                tile_size,
+                tile_stride,
+                is_video,
+                vae_per_channel_normalize,
+                timestep,
             )
             # Reshape back to video format
             decoded = rearrange(decoded, "(b t) c h w -> b c t h w", b=batch_size)
@@ -430,12 +470,12 @@ def tiled_decode(
         H, W = height, width
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
-        
+
         size_h = min(size_h, H)
         size_w = min(size_w, W)
         stride_h = min(stride_h, size_h)
         stride_w = min(stride_w, size_w)
-        
+
         # Create tiles
         tasks = sliding_2d_windows(
             height=H,
@@ -443,26 +483,28 @@ def tiled_decode(
             tile_size=(size_w, size_h),
             tile_stride=(stride_w, stride_h),
         )
-        
+
         # Get output dimensions
         _, spatial_scale, _ = get_vae_size_scale_factor(vae)
         out_h = H * spatial_scale
         out_w = W * spatial_scale
-        
+
         # Initialize accumulation tensors
         weight = torch.zeros((1, 1, out_h, out_w), dtype=dtype, device=device)
         values = torch.zeros((batch_size, 3, out_h, out_w), dtype=dtype, device=device)
-        
+
         # Process each tile
         for h, h_, w, w_ in tasks:
             # Extract tile
             tile_latent = latents[:, :, h:h_, w:w_]
-            
+
             # Decode tile
-            tile_latent = un_normalize_latents(tile_latent, vae, vae_per_channel_normalize)
+            tile_latent = un_normalize_latents(
+                tile_latent, vae, vae_per_channel_normalize
+            )
             tile_decoded = vae.decode(tile_latent.to(vae.dtype), return_dict=False)[0]
             tile_decoded = tile_decoded.to(dtype).to(device)
-            
+
             # Create mask for blending
             mask = build_mask(
                 tile_decoded,
@@ -472,15 +514,19 @@ def tiled_decode(
                     (size_w - stride_w) * spatial_scale,
                 ),
             ).to(dtype=dtype, device=device)
-            
+
             # Add to accumulation
             target_h = h * spatial_scale
             target_w = w * spatial_scale
             tile_h, tile_w = tile_decoded.shape[-2:]
-            
-            values[:, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += tile_decoded * mask
-            weight[:, :, target_h:target_h + tile_h, target_w:target_w + tile_w] += mask
-        
+
+            values[
+                :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+            ] += (tile_decoded * mask)
+            weight[
+                :, :, target_h : target_h + tile_h, target_w : target_w + tile_w
+            ] += mask
+
         # Normalize by weights
         decoded = values / weight
         return decoded
@@ -586,7 +632,13 @@ def vae_decode(
 
     if use_tiling:
         images = tiled_decode(
-            latents, vae, tile_size, tile_stride, is_video, vae_per_channel_normalize, timestep
+            latents,
+            vae,
+            tile_size,
+            tile_stride,
+            is_video,
+            vae_per_channel_normalize,
+            timestep,
         )
         return images
 
