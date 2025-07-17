@@ -2754,7 +2754,7 @@ class LTXMultiScalePipeline:
                 generator=kwargs.get("generator"),
             )
             upsampled_latents = (
-                upsampled_latents * (1 - second_pass_noise_scale) + noise * noise_scale
+                upsampled_latents * (1 - second_pass_noise_scale) + noise * second_pass_noise_scale
             )
 
         kwargs = original_kwargs
