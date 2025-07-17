@@ -2778,6 +2778,67 @@ class LTXMultiScalePipeline:
             self.video_pipeline.transformer, adapter_names, weights
         )
 
+    def _resize_conditioning_items_for_pass(
+        self, conditioning_items: Optional[List], target_height: int, target_width: int
+    ) -> Optional[List]:
+        """
+        Resize conditioning items in pixel space for the target dimensions.
+        This is crucial for multi-scale pipeline to avoid lossy latent interpolation.
+        """
+        if not conditioning_items:
+            return None
+
+        resized_items = []
+        for item in conditioning_items:
+            # Create a copy to avoid modifying the original
+            new_item = copy.deepcopy(item)
+
+            # Check if the conditioning item needs resizing
+            current_height, current_width = item.media_item.shape[-2:]
+            if current_height != target_height or current_width != target_width:
+                # Only resize pixel-space items (3 channels or less)
+                if item.media_item.shape[1] <= 3:
+                    # Resize in pixel space using the pipeline's resize method
+                    new_item.media_item = LTXVideoPipeline.resize_tensor(
+                        item.media_item, target_height, target_width
+                    )
+                    print(
+                        f"  Resized conditioning {item.conditioning_type}: {item.media_item.shape} -> {new_item.media_item.shape}"
+                    )
+                else:
+                    # For pre-encoded latents, we need to calculate the target latent size
+                    # and resize in latent space as a fallback (though this is less ideal)
+                    target_latent_height = (
+                        target_height // self.video_pipeline.vae_scale_factor
+                    )
+                    target_latent_width = (
+                        target_width // self.video_pipeline.vae_scale_factor
+                    )
+
+                    b, c, f, h, w = item.media_item.shape
+                    # Reshape to (b*f, c, h, w) for interpolation
+                    media_reshaped = item.media_item.permute(0, 2, 1, 3, 4).reshape(
+                        b * f, c, h, w
+                    )
+                    # Resize using bilinear interpolation
+                    media_resized = F.interpolate(
+                        media_reshaped,
+                        size=(target_latent_height, target_latent_width),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    # Reshape back to (b, c, f, h, w)
+                    new_item.media_item = media_resized.reshape(
+                        b, f, c, target_latent_height, target_latent_width
+                    ).permute(0, 2, 1, 3, 4)
+                    print(
+                        f"  Resized pre-encoded conditioning {item.conditioning_type}: {item.media_item.shape} -> {new_item.media_item.shape}"
+                    )
+
+            resized_items.append(new_item)
+
+        return resized_items
+
     def __call__(
         self,
         downscale_factor: float,
@@ -2790,12 +2851,20 @@ class LTXMultiScalePipeline:
         original_output_type = kwargs["output_type"]
         original_width = kwargs["width"]
         original_height = kwargs["height"]
+        original_conditioning_items = kwargs.get("conditioning_items")
 
         x_width = int(kwargs["width"] * downscale_factor)
         downscaled_width = x_width - (x_width % self.video_pipeline.vae_scale_factor)
         x_height = int(kwargs["height"] * downscale_factor)
         downscaled_height = x_height - (x_height % self.video_pipeline.vae_scale_factor)
 
+        # First pass: resize conditioning items for downscaled dimensions
+        print(
+            f"First pass: resizing conditioning for {downscaled_height}x{downscaled_width}"
+        )
+        kwargs["conditioning_items"] = self._resize_conditioning_items_for_pass(
+            original_conditioning_items, downscaled_height, downscaled_width
+        )
         kwargs["output_type"] = "latent"
         kwargs["width"] = downscaled_width
         kwargs["height"] = downscaled_height
@@ -2811,10 +2880,19 @@ class LTXMultiScalePipeline:
 
         kwargs = original_kwargs
 
+        # Second pass: resize conditioning items for upscaled dimensions
+        second_pass_height = downscaled_height * 2
+        second_pass_width = downscaled_width * 2
+        print(
+            f"Second pass: resizing conditioning for {second_pass_height}x{second_pass_width}"
+        )
+        kwargs["conditioning_items"] = self._resize_conditioning_items_for_pass(
+            original_conditioning_items, second_pass_height, second_pass_width
+        )
         kwargs["latents"] = upsampled_latents
         kwargs["output_type"] = original_output_type
-        kwargs["width"] = downscaled_width * 2
-        kwargs["height"] = downscaled_height * 2
+        kwargs["width"] = second_pass_width
+        kwargs["height"] = second_pass_height
         kwargs.update(**second_pass)
 
         result = self.video_pipeline(*args, **kwargs)
