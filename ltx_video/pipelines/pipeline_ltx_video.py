@@ -2673,7 +2673,7 @@ class LTXMultiScalePipeline:
                     new_item.media_item = LTXVideoPipeline.resize_tensor(
                         item.media_item, target_height, target_width
                     )
-                    print(
+                    logger.info(
                         f"  Resized conditioning {item.conditioning_type}: {item.media_item.shape} -> {new_item.media_item.shape}"
                     )
                 else:
@@ -2702,7 +2702,7 @@ class LTXMultiScalePipeline:
                     new_item.media_item = media_resized.reshape(
                         b, f, c, target_latent_height, target_latent_width
                     ).permute(0, 2, 1, 3, 4)
-                    print(
+                    logger.info(
                         f"  Resized pre-encoded conditioning {item.conditioning_type}: {item.media_item.shape} -> {new_item.media_item.shape}"
                     )
 
