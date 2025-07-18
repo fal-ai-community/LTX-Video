@@ -904,7 +904,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         # Temporal tiling parameters
         temporal_tile_size: Optional[int] = None,
         temporal_overlap: Optional[int] = None,
-        temporal_overlap_strength: float = 0.5,
+        temporal_overlap_strength_schedule: list[float] = [0.5],
         use_guiding_latents: bool = False,
         guiding_strength: float = 1.0,
         temporal_adain_factor: float = 0.0,
@@ -1099,7 +1099,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 media_items=media_items,
                 temporal_tile_size=temporal_tile_size,
                 temporal_overlap=temporal_overlap,
-                temporal_overlap_strength=temporal_overlap_strength,
+                temporal_overlap_strength_schedule=temporal_overlap_strength_schedule,
                 use_guiding_latents=use_guiding_latents,
                 guiding_strength=guiding_strength,
                 temporal_adain_factor=temporal_adain_factor,
@@ -2090,7 +2090,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         frame_rate: float,
         temporal_tile_size: int,
         temporal_overlap: int,
-        temporal_overlap_strength: float = 0.5,
+        temporal_overlap_strength_schedule: list[float] = 0.5,
         use_guiding_latents: bool = False,
         guiding_strength: float = 1.0,
         temporal_adain_factor: float = 0.0,
@@ -2159,6 +2159,11 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 f"Processing chunk {chunk_idx + 1}/{len(chunk_starts)}: frames {start_frame}-{end_frame}"
             )
 
+            if chunk_idx > len(temporal_overlap_strength_schedule) - 1:
+                temporal_overlap_strength = temporal_overlap_strength_schedule[-1]
+            else:
+                temporal_overlap_strength = temporal_overlap_strength_schedule[chunk_idx]
+
             # Prepare chunk-specific parameters
             chunk_kwargs = kwargs.copy()
             # Remove temporal tiling parameters to prevent recursion
@@ -2202,19 +2207,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
                 if use_guiding_latents:
                     try:
-                        """
-                        overlap_pixels = self._vae_decode(
-                            overlap_latents,
-                            vae_per_channel_normalize=kwargs.get(
-                                "vae_per_channel_normalize", True
-                            ),
-                            decode_timestep=kwargs.get("decode_timestep", 0.0),
-                            decode_noise_scale=kwargs.get("decode_noise_scale", 0.0),
-                            decode_tiling=kwargs.get("decode_tiling", False),
-                            decode_tile_size=kwargs.get("decode_tile_size", (64, 64)),
-                            decode_tile_stride=kwargs.get("decode_tile_stride", (32, 32)),
-                        )
-                        """
                         overlap_item = ConditioningItem(
                             media_item=overlap_latents.clone(),
                             conditioning_type="guiding",
@@ -2223,7 +2215,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         )
                         chunk_conditioning_items.append(overlap_item)
                         logger.info(
-                            f"  Added overlap conditioning: {overlap_item.media_item.shape}"
+                            f"  Added overlap conditioning: {overlap_item.media_item.shape} with strength {temporal_overlap_strength}"
                         )
 
                     except Exception as e:

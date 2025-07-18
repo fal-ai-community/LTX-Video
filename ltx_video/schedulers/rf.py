@@ -309,6 +309,7 @@ class RectifiedFlowScheduler(SchedulerMixin, ConfigMixin, TimestepShifter):
         sample: torch.FloatTensor,
         return_dict: bool = True,
         stochastic_sampling: Optional[bool] = False,
+        generator: Optional[torch.Generator] = None,
         **kwargs,
     ) -> Union[RectifiedFlowSchedulerOutput, Tuple]:
         """
@@ -364,7 +365,16 @@ class RectifiedFlowScheduler(SchedulerMixin, ConfigMixin, TimestepShifter):
         if stochastic_sampling:
             x0 = sample - timestep[..., None] * model_output
             next_timestep = timestep[..., None] - dt
-            prev_sample = self.add_noise(x0, torch.randn_like(sample), next_timestep)
+            prev_sample = self.add_noise(
+                x0,
+                torch.randn(
+                    sample.shape,
+                    dtype=sample.dtype,
+                    device=sample.device,
+                    generator=generator,
+                ),
+                next_timestep
+            )
         else:
             prev_sample = sample - dt * model_output
 
