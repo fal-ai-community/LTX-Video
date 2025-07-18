@@ -2136,9 +2136,13 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
         output_chunks = []
         first_chunk_result = None  # For AdaIN reference
+        num_chunks = len(chunk_starts)
 
-        for chunk_idx, (start_frame, end_frame) in enumerate(
-            zip(chunk_starts, chunk_ends)
+        for chunk_idx, (start_frame, end_frame) in tqdm(
+            enumerate(zip(chunk_starts, chunk_ends)),
+            total=num_chunks,
+            desc="Generating",
+            unit="chunk",
         ):
             chunk_num_frames = end_frame - start_frame
 
