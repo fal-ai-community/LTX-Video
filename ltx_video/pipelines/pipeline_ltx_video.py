@@ -2068,9 +2068,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         combined_latents = chunk_latents[0]  # Start with first chunk
 
         for i in range(1, len(chunk_latents)):
-            # Drop first output latent as it's a reinterpreted 8-frame latent
-            # understood as a 1-frame latent
-            current_chunk = chunk_latents[i][:, :, 1:, :, :]
+            current_chunk = chunk_latents[i]
 
             # Calculate overlap in latent space
             latent_overlap_frames = temporal_overlap // self.video_scale_factor
