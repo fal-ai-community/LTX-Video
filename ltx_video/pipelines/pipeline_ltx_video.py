@@ -34,6 +34,7 @@ from ltx_video.models.transformers.transformer3d import Transformer3DModel
 from ltx_video.schedulers.rf import TimestepShifter
 from ltx_video.utils.prompt_enhance_utils import generate_cinematic_prompt
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
+from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -2145,8 +2146,12 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         output_chunks = []
         first_chunk_result = None  # For AdaIN reference
 
-        for chunk_idx, (start_frame, end_frame) in enumerate(
-            zip(chunk_starts, chunk_ends)
+        num_chunks = len(chunk_starts)
+        for chunk_idx, (start_frame, end_frame) in tqdm(
+            enumerate(zip(chunk_starts, chunk_ends)),
+            desc="Generating",
+            unit="chunk",
+            total=num_chunks,
         ):
             chunk_num_frames = end_frame - start_frame
 
@@ -2754,7 +2759,8 @@ class LTXMultiScalePipeline:
                 generator=kwargs.get("generator"),
             )
             upsampled_latents = (
-                upsampled_latents * (1 - second_pass_noise_scale) + noise * second_pass_noise_scale
+                upsampled_latents * (1 - second_pass_noise_scale)
+                + noise * second_pass_noise_scale
             )
 
         kwargs = original_kwargs
