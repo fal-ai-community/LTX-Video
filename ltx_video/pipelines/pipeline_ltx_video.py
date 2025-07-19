@@ -1670,10 +1670,14 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         height == media_item.shape[-2] and width == media_item.shape[-1]
                     ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {media_item.shape[-2]}x{media_item.shape[-1]} - allowed only when media_frame_number == 0"
                     assert n_frames % 8 == 1
-                    assert (
-                        media_frame_number >= 0
-                        and media_frame_number + n_frames <= num_frames
-                    )
+
+                    if conditioning_type == "negative_index":
+                        assert media_frame_number < 0, "Negative index latents must have a negative frame number"
+                    else:
+                        assert (
+                            media_frame_number >= 0
+                            and media_frame_number + n_frames <= num_frames
+                        )
 
                     # Encode pixel-space conditioning media items
                     media_item_latents = vae_encode(
@@ -2492,7 +2496,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             if (
                 chunk_idx > 0  # Only add to chunks after the first
                 and optional_negative_index_latents is not None
-                and negative_index_position >= 0
+                and negative_index_position < 0
             ):
                 # First, ensure the negative index latents are encoded to latent space
                 if optional_negative_index_latents.shape[1] == 3:  # RGB channels
