@@ -915,6 +915,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         encode_tiling: bool = False,
         encode_tile_size: Tuple[int, int] = (512, 512),
         encode_tile_stride: Tuple[int, int] = (256, 256),
+        optional_negative_index_latents: Optional[torch.Tensor] = None,
+        negative_index_strength: float = 1.0,
+        negative_index_position: int = -1,
         **kwargs,
     ) -> Union[ImagePipelineOutput, Tuple]:
         """
@@ -1109,6 +1112,10 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 decode_tiling=decode_tiling,
                 decode_tile_size=decode_tile_size,
                 decode_tiling_stride=decode_tile_stride,
+                optional_negative_index_latents=optional_negative_index_latents,
+                negative_index_strength=negative_index_strength,
+                negative_index_position=negative_index_position,
+                tone_map_compression_ratio=tone_map_compression_ratio,
                 **kwargs,
             )
 
@@ -1724,6 +1731,56 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                     extra_conditioning_pixel_coords.append(pixel_coords)
                     extra_conditioning_mask.append(conditioning_mask)
 
+                elif conditioning_type == "negative_index":
+                    # Handle negative index latents - these are placed at negative temporal positions
+                    # to provide long-term visual memory without being treated as part of the sequence
+
+                    # Blend with noise based on strength
+                    if strength < 1.0:
+                        noise = randn_tensor(
+                            media_item_latents.shape,
+                            generator=generator,
+                            device=media_item_latents.device,
+                            dtype=media_item_latents.dtype,
+                        )
+                        media_item_latents = torch.lerp(
+                            noise, media_item_latents, strength
+                        )
+
+                    # Patchify and calculate pixel coordinates
+                    media_item_latents, latent_coords = self.patchifier.patchify(
+                        latents=media_item_latents
+                    )
+                    pixel_coords = latent_to_pixel_coords(
+                        latent_coords,
+                        self.vae,
+                        causal_fix=self.transformer.config.causal_temporal_positioning,
+                    )
+
+                    # Set negative frame indices for proper positional encoding
+                    # This is what makes these latents receive negative positional embeddings
+                    pixel_coords[:, 0] = (
+                        media_frame_number  # Use the negative frame number directly
+                    )
+                    extra_conditioning_num_latents += media_item_latents.shape[1]
+
+                    # Create conditioning mask
+                    conditioning_mask = torch.full(
+                        media_item_latents.shape[:2],
+                        strength,
+                        dtype=torch.float32,
+                        device=init_latents.device,
+                    )
+
+                    extra_conditioning_latents.append(media_item_latents)
+                    extra_conditioning_pixel_coords.append(pixel_coords)
+                    extra_conditioning_mask.append(conditioning_mask)
+
+                    logger.info(
+                        f"Added negative index latents: shape={media_item_latents.shape}, "
+                        f"negative_position={media_frame_number}, strength={strength}"
+                    )
+
                 elif media_frame_number == 0:
                     # Get the target spatial position of the latent conditioning item
                     media_item_latents, l_x, l_y = self._get_latent_spatial_position(
@@ -2094,6 +2151,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         use_guiding_latents: bool = False,
         guiding_strength: float = 1.0,
         temporal_adain_factor: float = 0.0,
+        optional_negative_index_latents: Optional[torch.Tensor] = None,
+        negative_index_strength: float = 1.0,
+        negative_index_position: int = -1,
         **kwargs,
     ):
         """
@@ -2162,7 +2222,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             if chunk_idx > len(temporal_overlap_strength_schedule) - 1:
                 temporal_overlap_strength = temporal_overlap_strength_schedule[-1]
             else:
-                temporal_overlap_strength = temporal_overlap_strength_schedule[chunk_idx]
+                temporal_overlap_strength = temporal_overlap_strength_schedule[
+                    chunk_idx
+                ]
 
             # Prepare chunk-specific parameters
             chunk_kwargs = kwargs.copy()
@@ -2425,6 +2487,49 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
 
                     # Store initialization latents for potential use in conditioning
                     chunk_kwargs["_chunk_init_latents"] = chunk_init_latents
+
+            # Handle negative index latents for temporal chunks (except the first one)
+            if (
+                chunk_idx > 0  # Only add to chunks after the first
+                and optional_negative_index_latents is not None
+                and negative_index_position >= 0
+            ):
+                # First, ensure the negative index latents are encoded to latent space
+                if optional_negative_index_latents.shape[1] == 3:  # RGB channels
+                    # Encode from pixel space to latent space
+                    neg_idx_latents = vae_encode(
+                        optional_negative_index_latents.to(
+                            dtype=self.vae.dtype, device=self.vae.device
+                        ),
+                        self.vae,
+                        vae_per_channel_normalize=kwargs.get(
+                            "vae_per_channel_normalize", True
+                        ),
+                        use_tiling=kwargs.get("encode_tiling", False),
+                        tile_size=kwargs.get("encode_tile_size", (512, 512)),
+                        tile_stride=kwargs.get("encode_tile_stride", (256, 256)),
+                    ).to(dtype=torch.float32)
+                else:
+                    # Already in latent space
+                    neg_idx_latents = optional_negative_index_latents
+
+                # Create a ConditioningItem for the negative index latents
+                # These will be placed at a negative temporal position
+                neg_idx_item = ConditioningItem(
+                    media_item=neg_idx_latents.clone(),
+                    conditioning_type="negative_index",  # Special type for negative index conditioning
+                    media_frame_number=negative_index_position,  # Negative position
+                    conditioning_strength=negative_index_strength,
+                )
+
+                # Add to chunk conditioning items
+                if chunk_kwargs.get("conditioning_items") is None:
+                    chunk_kwargs["conditioning_items"] = []
+                chunk_kwargs["conditioning_items"].append(neg_idx_item)
+
+                logger.info(
+                    f"  Added negative index latents: {neg_idx_latents.shape} at position {negative_index_position} with strength {negative_index_strength}"
+                )
 
             # Run complete denoising process for this chunk
             result = self.__call__(
