@@ -226,8 +226,8 @@ def tiled_encode(
                 ] += mask
 
             # Normalize by weights
-            latents = values / weight
-            return latents
+            values.div_(weight)
+            return values
         else:
             # Image VAE - process frame by frame then tile spatially
             media_items = rearrange(media_items, "b c t h w -> (b t) c h w")
@@ -307,8 +307,8 @@ def tiled_encode(
             ] += mask
 
         # Normalize by weights
-        latents = values / weight
-        return latents
+        values.div_(weight)
+        return values
 
 
 @torch.no_grad()
@@ -447,12 +447,12 @@ def tiled_decode(
                 ] += mask
 
             # Normalize by weights
-            decoded = values / weight
-            return decoded
+            values.div_(weight)
+            return values
         else:
             # Image VAE - process frame by frame
             latents = rearrange(latents, "b c t h w -> (b t) c h w")
-            decoded = tiled_decode(
+            latents = tiled_decode(
                 latents,
                 vae,
                 tile_size,
@@ -462,8 +462,8 @@ def tiled_decode(
                 timestep,
             )
             # Reshape back to video format
-            decoded = rearrange(decoded, "(b t) c h w -> b c t h w", b=batch_size)
-            return decoded
+            latents = rearrange(latents, "(b t) c h w -> b c t h w", b=batch_size)
+            return latents
     else:
         # Image case [B, C, H, W]
         batch_size, channels, height, width = latents.shape
@@ -528,8 +528,8 @@ def tiled_decode(
             ] += mask
 
         # Normalize by weights
-        decoded = values / weight
-        return decoded
+        values.div_(weight)
+        return values
 
 
 def vae_encode(
@@ -609,10 +609,12 @@ def vae_encode(
         latents = vae.encode(media_items).latent_dist.sample()
 
     latents = normalize_latents(latents, vae, vae_per_channel_normalize)
+
     if is_video_shaped and not isinstance(
         vae, (VideoAutoencoder, CausalVideoAutoencoder)
     ):
         latents = rearrange(latents, "(b n) c h w -> b c n h w", b=batch_size)
+
     return latents
 
 
@@ -646,6 +648,7 @@ def vae_decode(
         vae, (VideoAutoencoder, CausalVideoAutoencoder)
     ):
         latents = rearrange(latents, "b c n h w -> (b n) c h w")
+
     if split_size > 1:
         if len(latents) % split_size != 0:
             raise ValueError(
@@ -668,6 +671,7 @@ def vae_decode(
         vae, (VideoAutoencoder, CausalVideoAutoencoder)
     ):
         images = rearrange(images, "(b n) c h w -> b c n h w", b=batch_size)
+
     return images
 
 
