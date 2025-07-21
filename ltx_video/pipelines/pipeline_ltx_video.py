@@ -2293,14 +2293,14 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             if kwargs.get("conditioning_items"):
                 for item in kwargs["conditioning_items"]:
                     # Encode if not already in latent space
-                    if not hasattr(conditioning_item, "_encoded_latents"):
-                        if conditioning_item.is_latent_space:
+                    if not hasattr(item, "_encoded_latents"):
+                        if item.is_latent_space:
                             # Already in latent space, use directly
-                            conditioning_item._encoded_latents = conditioning_item.media_item
+                            item._encoded_latents = item.media_item
                         else:
                             # Encode pixel space item to latent space
-                            conditioning_item._encoded_latents = vae_encode(
-                                conditioning_item.media_item.to(
+                            item._encoded_latents = vae_encode(
+                                item.media_item.to(
                                     dtype=self.vae.dtype, device=self.vae.device
                                 ),
                                 self.vae,
@@ -2312,7 +2312,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                                 tile_stride=kwargs.get("encode_tile_stride", (256, 256)),
                             ).to(dtype=torch.float32)
                             logger.info(
-                                f"  Encoded conditioning item: {conditioning_item.media_item.shape} -> {conditioning_item._encoded_latents.shape}"
+                                f"  Encoded conditioning item: {item.media_item.shape} -> {item._encoded_latents.shape}"
                             )
 
                     # Now work in latent space for all calculations
