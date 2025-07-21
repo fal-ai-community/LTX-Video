@@ -1677,7 +1677,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         assert (
                             media_frame_number >= 0
                             and media_frame_number + n_frames <= num_frames
-                        )
+                        ), f"Media frame number {media_frame_number} plus the number of conditioning frames {n_frames} must be within the total number of frames {num_frames}"
 
                     # Encode pixel-space conditioning media items
                     media_item_latents = vae_encode(
@@ -2292,120 +2292,92 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             # Add guiding latents for this chunk if specified
             if kwargs.get("conditioning_items"):
                 for item in kwargs["conditioning_items"]:
-                    if item.conditioning_type in ["guiding", "guiding_latents"]:
-                        # First, encode the guiding video to latent space if not already done
-                        if not hasattr(item, "_encoded_latents"):
-                            if item.is_latent_space:
-                                item._encoded_latents = item.media_item
-                            else:
-                                item._encoded_latents = vae_encode(
-                                    item.media_item.to(
-                                        dtype=self.vae.dtype, device=self.vae.device
-                                    ),
-                                    self.vae,
-                                    vae_per_channel_normalize=kwargs.get(
-                                        "vae_per_channel_normalize", True
-                                    ),
-                                    use_tiling=kwargs.get("encode_tiling", False),
-                                    tile_size=kwargs.get(
-                                        "encode_tile_size", (512, 512)
-                                    ),
-                                    tile_stride=kwargs.get(
-                                        "encode_tile_stride", (256, 256)
-                                    ),
-                                ).to(dtype=torch.float32)
-                                logger.info(
-                                    f"  Encoded guiding video: {item.media_item.shape} -> {item._encoded_latents.shape}"
-                                )
-
-                        # Now work in latent space for all calculations
-                        latent_item_start_frame = (
-                            item.media_frame_number // self.video_scale_factor
-                        )
-                        latent_item_end_frame = (
-                            latent_item_start_frame + item._encoded_latents.shape[2]
-                        )
-                        latent_chunk_start = start_frame // self.video_scale_factor
-                        latent_chunk_end = (
-                            latent_chunk_start
-                            + (chunk_num_frames - 1) // self.video_scale_factor
-                            + 1
-                        )
-
-                        # Check if this guiding item overlaps with current chunk (in latent space)
-                        if (
-                            latent_item_start_frame < latent_chunk_end
-                            and latent_item_end_frame > latent_chunk_start
-                        ):
-                            # Calculate overlap region in latent space
-                            chunk_start_in_item = max(
-                                0, latent_chunk_start - latent_item_start_frame
-                            )
-                            chunk_end_in_item = min(
-                                item._encoded_latents.shape[2],
-                                chunk_start_in_item
-                                + (latent_chunk_end - latent_chunk_start),
-                            )
-
-                            if chunk_end_in_item > chunk_start_in_item:
-                                # Ensure frame count satisfies n_frames % 8 == 1
-                                extracted_frames = (
-                                    chunk_end_in_item - chunk_start_in_item
-                                )
-                                if extracted_frames % 8 != 1:
-                                    adjusted_frames = (
-                                        (extracted_frames - 1) // 8
-                                    ) * 8 + 1
-                                    if adjusted_frames < 1:
-                                        adjusted_frames = 1
-                                    chunk_end_in_item = (
-                                        chunk_start_in_item + adjusted_frames
-                                    )
-                                    chunk_end_in_item = min(
-                                        chunk_end_in_item, item.media_item.shape[2]
-                                    )
-
-                            if chunk_end_in_item > chunk_start_in_item:
-                                # Extract the relevant portion from encoded latents
-                                chunk_item = copy.deepcopy(item)
-                                chunk_item.media_item = item._encoded_latents[
-                                    :, :, chunk_start_in_item:chunk_end_in_item
-                                ]
-                                # Convert back to pixel space for frame number
-                                chunk_item.media_frame_number = max(
-                                    0,
-                                    (latent_item_start_frame - latent_chunk_start)
-                                    * self.video_scale_factor,
-                                )
-                                chunk_item.conditioning_strength = guiding_strength
-                                chunk_conditioning_items.append(chunk_item)
-                                logger.info(
-                                    f"  Added guiding conditioning: {chunk_item.media_item.shape} (latent space, chunk {chunk_idx+1})"
-                                )
-
-            # Add other conditioning items (like first frame conditioning)
-            if kwargs.get("conditioning_items"):
-                for item in kwargs["conditioning_items"]:
-                    if item.conditioning_type not in ["guiding", "guiding_latents"]:
-                        # First frame conditioning should ONLY apply to the first chunk
-                        if (
-                            item.conditioning_type == "image"
-                            and item.media_frame_number == 0
-                        ):
-                            # Only include first frame conditioning in the first chunk
-                            if chunk_idx == 0:
-                                chunk_conditioning_items.append(item)
-                            # Skip first frame conditioning for all other chunks
+                    # Encode if not already in latent space
+                    if not hasattr(conditioning_item, "_encoded_latents"):
+                        if conditioning_item.is_latent_space:
+                            # Already in latent space, use directly
+                            conditioning_item._encoded_latents = conditioning_item.media_item
                         else:
-                            # Include other regular conditioning items if they apply to this chunk
-                            # Adjust frame number relative to chunk start
-                            item_frame_in_chunk = item.media_frame_number - start_frame
-                            if 0 <= item_frame_in_chunk < chunk_num_frames:
-                                # Create a copy with adjusted frame number
-                                chunk_item = copy.deepcopy(item)
-                                chunk_item.media_frame_number = item_frame_in_chunk
-                                chunk_conditioning_items.append(chunk_item)
-                    # Note: guiding items are handled above and should not be included here to avoid duplication
+                            # Encode pixel space item to latent space
+                            conditioning_item._encoded_latents = vae_encode(
+                                conditioning_item.media_item.to(
+                                    dtype=self.vae.dtype, device=self.vae.device
+                                ),
+                                self.vae,
+                                vae_per_channel_normalize=kwargs.get(
+                                    "vae_per_channel_normalize", True
+                                ),
+                                use_tiling=kwargs.get("encode_tiling", False),
+                                tile_size=kwargs.get("encode_tile_size", (512, 512)),
+                                tile_stride=kwargs.get("encode_tile_stride", (256, 256)),
+                            ).to(dtype=torch.float32)
+                            logger.info(
+                                f"  Encoded conditioning item: {conditioning_item.media_item.shape} -> {conditioning_item._encoded_latents.shape}"
+                            )
+
+                    # Now work in latent space for all calculations
+                    item_latents = item._encoded_latents
+                    latent_item_start_frame = (
+                        item.media_frame_number // self.video_scale_factor
+                    )
+                    latent_item_end_frame = (
+                        latent_item_start_frame + item_latents.shape[2]
+                    )
+                    latent_chunk_start = start_frame // self.video_scale_factor
+                    latent_chunk_end = (
+                        latent_chunk_start
+                        + (chunk_num_frames - 1) // self.video_scale_factor
+                        + 1
+                    )
+
+                    # Check if this guiding item overlaps with current chunk (in latent space)
+                    if (
+                        latent_item_start_frame < latent_chunk_end
+                        and latent_item_end_frame > latent_chunk_start
+                    ):
+                        # Calculate overlap region in latent space
+                        chunk_start_in_item = max(
+                            0, latent_chunk_start - latent_item_start_frame
+                        )
+                        chunk_end_in_item = min(
+                            item_latents.shape[2],
+                            chunk_start_in_item
+                            + (latent_chunk_end - latent_chunk_start),
+                        )
+
+                        if chunk_end_in_item > chunk_start_in_item:
+                            # Ensure frame count satisfies n_frames % 8 == 1
+                            extracted_frames = (
+                                chunk_end_in_item - chunk_start_in_item
+                            )
+                            if extracted_frames % 8 != 1:
+                                adjusted_frames = (
+                                    (extracted_frames - 1) // 8
+                                ) * 8 + 1
+                                if adjusted_frames < 1:
+                                    adjusted_frames = 1
+
+                                chunk_end_in_item = (
+                                    chunk_start_in_item + adjusted_frames
+                                )
+                                chunk_end_in_item = min(
+                                    chunk_end_in_item, item.media_item.shape[2]
+                                )
+
+                        if chunk_end_in_item > chunk_start_in_item:
+                            # Extract the relevant portion from encoded latents
+                            chunk_item = copy.deepcopy(item)
+                            chunk_item.media_item = item._encoded_latents[
+                                :, :, chunk_start_in_item:chunk_end_in_item
+                            ]
+
+                            # Convert back to pixel space for frame number
+                            chunk_item.media_frame_number = max(
+                                0,
+                                (latent_item_start_frame - latent_chunk_start)
+                                * self.video_scale_factor,
+                            )
+                            chunk_conditioning_items.append(chunk_item)
 
             chunk_kwargs["conditioning_items"] = (
                 chunk_conditioning_items if chunk_conditioning_items else None
