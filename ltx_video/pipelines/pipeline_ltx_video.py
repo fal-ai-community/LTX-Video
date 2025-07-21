@@ -905,6 +905,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         temporal_tile_size: Optional[int] = None,
         temporal_overlap: Optional[int] = None,
         temporal_overlap_strength_schedule: list[float] = [0.5],
+        return_individual_chunks: bool = False,
         use_guiding_latents: bool = False,
         guiding_strength: float = 1.0,
         temporal_adain_factor: float = 0.0,
@@ -1012,6 +1013,9 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 Should be less than temporal_tile_size.
             temporal_overlap_strength (`float`, *optional*, defaults to `0.5`):
                 Strength of conditioning from overlapping frames when extending video.
+            return_individual_chunks (`bool`, *optional*, defaults to `False`):
+                If True, return each temporal chunk individually as a list instead of merging them.
+                Only applies when temporal_tile_size is used. Useful for debugging or custom blending.
             use_guiding_latents (`bool`, *optional*, defaults to `False`):
                 Whether to use conditioning_items as guiding latents for temporal tiling (e.g., IC-LoRA guides).
             guiding_strength (`float`, *optional*, defaults to `1.0`):
@@ -1021,9 +1025,12 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         Examples:
 
         Returns:
-            [`~pipelines.ImagePipelineOutput`] or `tuple`:
+            [`~pipelines.ImagePipelineOutput`] or `tuple` or `List`:
                 If `return_dict` is `True`, [`~pipelines.ImagePipelineOutput`] is returned, otherwise a `tuple` is
-                returned where the first element is a list with the generated images
+                returned where the first element is a list with the generated images.
+                When `return_individual_chunks` is `True` and temporal tiling is used, returns a list of 
+                [`~pipelines.ImagePipelineOutput`] objects (if `return_dict=True`) or a list of tuples 
+                (if `return_dict=False`), one for each temporal chunk.
         """
         if "mask_feature" in kwargs:
             deprecation_message = "The use of `mask_feature` is deprecated. It is no longer used in any computation and that doesn't affect the end results. It will be removed in a future version."
@@ -1103,6 +1110,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                 temporal_tile_size=temporal_tile_size,
                 temporal_overlap=temporal_overlap,
                 temporal_overlap_strength_schedule=temporal_overlap_strength_schedule,
+                return_individual_chunks=return_individual_chunks,
                 use_guiding_latents=use_guiding_latents,
                 guiding_strength=guiding_strength,
                 temporal_adain_factor=temporal_adain_factor,
@@ -2152,6 +2160,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         temporal_tile_size: int,
         temporal_overlap: int,
         temporal_overlap_strength_schedule: list[float] = 0.5,
+        return_individual_chunks: bool = False,
         use_guiding_latents: bool = False,
         guiding_strength: float = 1.0,
         temporal_adain_factor: float = 0.0,
@@ -2166,6 +2175,10 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         1. Running complete denoising processes on temporal chunks
         2. Using previous chunk results as conditioning for subsequent chunks
         3. Each chunk goes through the full denoising pipeline (all timesteps)
+
+        Args:
+            return_individual_chunks (bool): If True, return each temporal chunk individually
+                as a list instead of merging them. Useful for debugging or custom blending.
         """
         is_video = kwargs.get("is_video", True)
         device = self._execution_device
@@ -2587,6 +2600,18 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
         if original_generator_state is not None:
             kwargs["generator"].set_state(original_generator_state)
 
+        # Return individual chunks if requested
+        if return_individual_chunks:
+            logger.info(f"Returning {len(output_chunks)} individual chunks")
+            if kwargs.get("return_dict", True):
+                return output_chunks  # Return list of ImagePipelineOutput objects
+            else:
+                # Return list of tuples if return_dict=False
+                return [
+                    (chunk.images,) if hasattr(chunk, "images") else chunk
+                    for chunk in output_chunks
+                ]
+
         # Combine chunks with overlap blending
         logger.info("Combining chunks with temporal blending...")
         final_output = self._combine_temporal_chunks(
@@ -2838,6 +2863,7 @@ class LTXMultiScalePipeline:
         kwargs["conditioning_items"] = self._resize_conditioning_items_for_pass(
             original_conditioning_items, downscaled_height, downscaled_width
         )
+        kwargs["return_individual_chunks"] = False
 
         kwargs.update(**first_pass)
 
