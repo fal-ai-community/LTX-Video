@@ -235,13 +235,9 @@ def linear_overlap_blend(
 
     # Create blending weights
     blend_weights = torch.linspace(
-        1.0, 0.0, overlap_frames, device=existing_latents.device
-    )
-    blend_weights = (
-        blend_weights.view(1, 1, overlap_frames, 1, 1)
-        if temporal_axis == 2
-        else blend_weights
-    )
+        1.0, 0.0, overlap_frames + 2, device=existing_latents.device
+    )[1:-1]
+    blend_weights = blend_weights.view(1, 1, -1, 1, 1) if temporal_axis == 2 else blend_weights
 
     # Blend the overlap region
     blended_overlap = existing_overlap * blend_weights + new_overlap * (
@@ -1645,7 +1641,7 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
             )
 
             # Process each conditioning item
-            for conditioning_item in conditioning_items:
+            for i, conditioning_item in enumerate(conditioning_items):
                 media_item = conditioning_item.media_item
                 media_frame_number = conditioning_item.media_frame_number
                 strength = conditioning_item.conditioning_strength
@@ -1697,6 +1693,8 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         tile_stride=encode_tile_stride,
                     ).to(dtype=init_latents.dtype)
 
+                logger.info(f"media_item_latents shape: {media_item_latents.shape}, conditioning_type: {conditioning_type}, index: {i}")
+
                 # Handle the different conditioning cases
                 if conditioning_type in ["guiding", "guiding_latents"]:
                     # For guiding latents, we skip the spatial positioning logic
@@ -1738,7 +1736,6 @@ class LTXVideoPipeline(DiffusionPipeline, LTXVideoLoraLoaderMixin):
                         dtype=torch.float32,
                         device=init_latents.device,
                     )
-
                     extra_conditioning_latents.append(media_item_latents)
                     extra_conditioning_pixel_coords.append(pixel_coords)
                     extra_conditioning_mask.append(conditioning_mask)
@@ -2815,6 +2812,9 @@ class LTXMultiScalePipeline:
         second_pass: dict,
         second_pass_noise_scale: float = 0.0,
         tone_map_compression_ratio: float = 0.0,
+        detail_lora_path: str | None = None,
+        detail_lora_kwargs: dict[str, Any] = {},
+        detail_lora_scale: float = 1.0,
         *args: Any,
         **kwargs: Any,
     ) -> Any:
@@ -2850,6 +2850,36 @@ class LTXMultiScalePipeline:
             latents=upsampled_latents, reference_latents=latents
         )
 
+        kwargs = original_kwargs
+
+        second_pass_height = downscaled_height * 2
+        second_pass_width = downscaled_width * 2
+
+        kwargs["output_type"] = original_output_type
+        kwargs["width"] = second_pass_width
+        kwargs["height"] = second_pass_height
+
+        if detail_lora_path:
+            self.load_lora_weights(
+                detail_lora_path,
+                **detail_lora_kwargs,
+                adapter_name="detail_lora",
+            )
+            self.set_adapters(
+                ["detail_lora"],
+                [detail_lora_scale],
+            )
+            kwargs["conditioning_items"] = [
+                ConditioningItem(
+                    upsampled_latents.detach().clone(),
+                    conditioning_type="guiding_latents",
+                )
+            ]
+        else:
+            kwargs["conditioning_items"] = self._resize_conditioning_items_for_pass(
+                original_conditioning_items, second_pass_height, second_pass_width
+            )
+
         if second_pass_noise_scale > 0:
             noise = torch.randn(
                 upsampled_latents.shape,
@@ -2862,19 +2892,7 @@ class LTXMultiScalePipeline:
                 + noise * second_pass_noise_scale
             )
 
-        kwargs = original_kwargs
-
-        second_pass_height = downscaled_height * 2
-        second_pass_width = downscaled_width * 2
-
         kwargs["latents"] = upsampled_latents
-        kwargs["output_type"] = original_output_type
-        kwargs["width"] = second_pass_width
-        kwargs["height"] = second_pass_height
-        kwargs["conditioning_items"] = self._resize_conditioning_items_for_pass(
-            original_conditioning_items, second_pass_height, second_pass_width
-        )
-
         kwargs.update(**second_pass)
 
         result = self.video_pipeline(*args, **kwargs)
